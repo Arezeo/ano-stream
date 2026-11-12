@@ -327,10 +327,19 @@ def worker(args):
     creation = {'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
     process = subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',**creation)
+    if os.name!='nt':
+        def terminate_worker(_signal,_frame):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM,terminate_worker)
     # Output duration alone cannot bound a capture device stuck before its first frame.
     def stop_stalled_preview():
         if process.poll() is None:
             process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
