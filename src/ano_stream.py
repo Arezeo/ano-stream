@@ -162,6 +162,20 @@ def helper():
     return path
 
 
+def capture_tool():
+    value = os.environ.get('ANO_CAPTURE')
+    path = Path(value) if value else HOME/'tools/window-capture'
+    if not path.is_file():
+        raise ValueError('Build window-capture into ANO_STREAM_HOME/tools or use --capture screen-crop; see docs/WORKFLOW.md')
+    return path
+
+
+def fit_size(win, size):
+    """Largest even size with the window's aspect ratio that fits inside size."""
+    scale = min(size[0]/win['w'],size[1]/win['h'])
+    return [max(16,int(win['w']*scale)//2*2),max(16,int(win['h']*scale)//2*2)]
+
+
 def windows(backend):
     if backend=='windows':
         return native_windows()
@@ -214,10 +228,15 @@ def mac_geometry(win):
     return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
 
 
-def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None):
+def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None):
     if backend=='windows':
         source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
         crop,encoder = '','h264_nvenc'
+    elif window_size:
+        # Raw BGRA from window-capture (ScreenCaptureKit): only the chosen window's pixels.
+        source = ['-f','rawvideo','-pix_fmt','bgra','-video_size','x'.join(map(str,window_size)),'-framerate',str(fps),
+                  '-use_wallclock_as_timestamps','1','-i','pipe:0']
+        crop,encoder = '','h264_videotoolbox'
     else:
         source = ['-f','avfoundation','-capture_cursor','0','-framerate',str(fps),'-i','Capture screen 0']
         if not mac_crop:
@@ -225,7 +244,8 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
         x,y,w,h = mac_crop
         crop,encoder = f'crop={w}:{h}:{x}:{y},','h264_videotoolbox'
     w,h = size
-    vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
+    matrix = ':out_color_matrix=bt709:out_range=tv' if window_size else ''
+    vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease{matrix},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
     command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,
                '-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100',
                '-map','0:v:0','-map','1:a:0','-vf',vf,'-c:v',encoder,'-b:v',bitrate,
@@ -233,6 +253,8 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
                '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
                '-progress','pipe:1','-stats_period','1','-nostats']
     command += ['-preset','p4','-rc','cbr'] if backend=='windows' else ['-realtime','1','-allow_sw','0']
+    if window_size:
+        command += ['-colorspace','bt709','-color_primaries','bt709','-color_trc','bt709']
     if output:
         command += ['-t',str(output[1]),'-f','matroska',str(output[0])]
     elif len(targets)==1:
@@ -295,18 +317,25 @@ def inspect_plan(args, publish=True):
     else:
         targets,missing,secrets = [('preview',{'resolution':[1920,1080],'bitrate':'6000k'},'')],[],[]
     size,rate = common_settings(targets,args)
-    crop = mac_geometry(win) if backend=='macos' else None
+    window_capture = backend=='macos' and getattr(args,'capture','window')=='window'
+    crop = mac_geometry(win) if backend=='macos' and not window_capture else None
+    window_size = fit_size(win,size) if window_capture else None
     if backend=='macos':
         access = json.loads(subprocess.check_output([str(helper()),'permissions'],text=True,timeout=10))
         if not access.get('screen_recording') and not args.dry_run:
             raise ValueError('Screen Recording permission is not granted on this Mac; allow the capture process in System Settings > Privacy & Security > Screen & System Audio Recording')
     output = (HOME/'previews'/(args.run_id+'.mkv'),args.seconds) if not publish else None
-    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop)
+    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size)
+    # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
+    capture_command = [str(capture_tool()),'--match',args.window,'--width',str(window_size[0]),
+                       '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
             'audio':'Silent stereo; game/microphone capture is not enabled',
             'one_encode':True,'command':[redact(a,secrets)for a in command],
+            'capture':'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)' if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
+            'capture_command':capture_command,
             'observed_capture_fps':None,'platform_receipt':'unknown'}
     if backend=='macos':
         plan['screen_recording_permission'] = access.get('screen_recording',False)
@@ -339,8 +368,14 @@ def worker(args):
     logfile = HOME/'logs'/(args.run_id+'.log')
     progressfile = HOME/'logs'/(args.run_id+'-progress.json')
     creation = {'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-    process = subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+    capture = None
+    if plan.get('capture_command'):
+        with logfile.open('a',encoding='utf-8')as log:
+            capture = subprocess.Popen(plan['capture_command'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=log,**creation)
+    process = subprocess.Popen(command,stdin=capture.stdout if capture else subprocess.DEVNULL,stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',**creation)
+    if capture:
+        capture.stdout.close()
     if os.name!='nt':
         def terminate_worker(_signal,_frame):
             raise SystemExit(0)
@@ -348,6 +383,8 @@ def worker(args):
     # Output duration alone cannot bound a capture device stuck before its first frame.
     def stop_stalled_preview():
         terminate_process(process)
+        if capture:
+            terminate_process(capture)
     timer = threading.Timer(args.seconds+20,stop_stalled_preview) if preview else None
     if timer:
         timer.daemon = True
@@ -369,12 +406,16 @@ def worker(args):
                 frame = {}
         code = process.wait()
         thread.join(timeout=2)
-        write_json(HOME/'logs'/(args.run_id+'-exit.json'),{'at':time.time(),'code':code,'platform_receipt':'unknown','preview_file':preview})
+        if capture:
+            terminate_process(capture)
+        write_json(HOME/'logs'/(args.run_id+'-exit.json'),{'at':time.time(),'code':code,'capture_code':capture.returncode if capture else None,'platform_receipt':'unknown','preview_file':preview})
         return code
     finally:
         if timer:
             timer.cancel()
         terminate_process(process)
+        if capture:
+            terminate_process(capture)
 
 
 def launch(args):
@@ -432,6 +473,8 @@ def main():
         item.add_argument('--window',required=True)
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')
+        item.add_argument('--capture',choices=['window','screen-crop'],default='window',
+                          help='macOS: window = ScreenCaptureKit single-window capture (default); screen-crop = legacy whole-display grab cropped to the window')
         item.add_argument('--fps',type=int,choices=range(1,61),default=60,metavar='1..60')
         item.add_argument('--resolution')
         item.add_argument('--bitrate')
