@@ -144,6 +144,16 @@ class StreamTests(unittest.TestCase):
         self.assertIn('Capture screen 0',cmd)
         self.assertNotIn('pipe:0',cmd)
 
+    def test_window_id_pins_one_of_several_windows_with_the_same_title(self):
+        items = [{'id':1,'owner':'Arc','name':'AGENT NUMBER ONE','w':2000,'h':1300},
+                 {'id':2,'owner':'Arc','name':'AGENT NUMBER ONE','w':1000,'h':800}]
+        self.assertEqual(s.choose_window(items,'Arc AGENT NUMBER ONE')['id'],1)
+        self.assertEqual(s.choose_window(items,'Arc AGENT NUMBER ONE',2)['id'],2)
+        with self.assertRaisesRegex(ValueError,'id 3'):
+            s.choose_window(items,'Arc AGENT NUMBER ONE',3)
+        with self.assertRaisesRegex(ValueError,'id 2'):
+            s.choose_window(items,'Safari',2)
+
 
 if __name__=='__main__':
     unittest.main()

@@ -14,7 +14,8 @@
 // (case-insensitive) and re-resolves it whenever the window is closed or
 // recreated. If no matching window is capturable for 60 s the tool exits, so a
 // dead window ends the broadcast instead of freezing on a stale frame.
-// --window-id pins one window id for its whole life (no re-resolve).
+// --window-id pins one window id for its whole life (no re-resolve). With both
+// --window-id and --match, the window must have that id AND a matching title.
 //
 // Exit codes: 0 done, 2 usage, 3 no permission, 4 window not found,
 // 5 capture could not start, 6 output closed.
@@ -189,7 +190,13 @@ func describe(_ w: SCWindow) -> String {
 /// large enough to be a real browser window; the largest wins.
 func resolveWindow() async -> SCWindow? {
     guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return nil }
-    if windowID > 0 { return content.windows.first { $0.windowID == windowID } }
+    if windowID > 0 {
+        // A pinned id must also still match the title text, if one was given.
+        return content.windows.first { w in
+            w.windowID == windowID
+                && (match.isEmpty || "\(w.owningApplication?.applicationName ?? "") \(w.title ?? "")".lowercased().contains(match))
+        }
+    }
     let found = content.windows.filter { w in
         w.windowLayer == 0 && w.frame.width > 320 && w.frame.height > 200
             && "\(w.owningApplication?.applicationName ?? "") \(w.title ?? "")".lowercased().contains(match)

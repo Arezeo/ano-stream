@@ -184,11 +184,12 @@ def windows(backend):
     raise ValueError('Window capture supports macOS and native Windows only')
 
 
-def choose_window(items, match):
+def choose_window(items, match, window_id=None):
     candidates = [w for w in items if w['w']>320 and w['h']>200
-                  and match.casefold() in (w['owner']+' '+w['name']).casefold()]
+                  and match.casefold() in (w['owner']+' '+w['name']).casefold()
+                  and (window_id is None or w['id']==window_id)]
     if not candidates:
-        raise ValueError('No visible window matches '+repr(match)+'; run ano-stream devices')
+        raise ValueError('No visible window matches '+repr(match)+(' with id '+str(window_id) if window_id else '')+'; run ano-stream devices')
     return max(candidates,key=lambda w:w['w']*w['h'])
 
 
@@ -308,7 +309,7 @@ def stop_owned(run):
 
 def inspect_plan(args, publish=True):
     backend = backend_name(args.backend)
-    win = choose_window(windows(backend),args.window)
+    win = choose_window(windows(backend),args.window,getattr(args,'window_id',None))
     cfg = read_json(CONFIG)
     if cfg is None:
         raise ValueError('No config; run ano-stream init')
@@ -329,6 +330,8 @@ def inspect_plan(args, publish=True):
     # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
     capture_command = [str(capture_tool()),'--match',args.window,'--width',str(window_size[0]),
                        '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
+    if capture_command and getattr(args,'window_id',None):
+        capture_command += ['--window-id',str(args.window_id)]
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
@@ -471,6 +474,7 @@ def main():
     for name in ('up','preview'):
         item = sub.add_parser(name)
         item.add_argument('--window',required=True)
+        item.add_argument('--window-id',type=int,help='Pin one window id (from devices); the window must also match --window. Use when several windows of one app share a title.')
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')
         item.add_argument('--capture',choices=['window','screen-crop'],default='window',
