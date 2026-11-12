@@ -3,6 +3,9 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -73,7 +76,8 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(cmd.count('-c:v'),1)
         self.assertIn('h264_nvenc',cmd)
         self.assertEqual(cmd.count('-map'),2)
-        self.assertEqual(cmd[cmd.index('-g')+1],'60')
+        self.assertEqual(cmd[cmd.index('-g')+1],'120')
+        self.assertIn('scale=1920:1080',cmd[cmd.index('-vf')+1])
         self.assertIn('tee',cmd)
         self.assertIn('-use_fifo',cmd)
         self.assertNotIn('desktop',cmd)
@@ -83,6 +87,14 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-t')+1],'3')
         self.assertEqual(cmd[-2],'matroska')
         self.assertFalse(any('rtmp://'in item or 'rtmps://'in item for item in cmd))
+
+    def test_macos_uses_hardware_and_verified_geometry(self):
+        cmd = s.make_command('ffmpeg','macos',{},[('youtube',{},'rtmp://localhost/test')],mac_crop=[10,20,3840,2160])
+        self.assertEqual(cmd[cmd.index('-allow_sw')+1],'0')
+        self.assertIn('crop=3840:2160:10:20',cmd[cmd.index('-vf')+1])
+        self.assertIn('fps=60',cmd[cmd.index('-vf')+1])
+        with self.assertRaisesRegex(ValueError,'verified display geometry'):
+            s.make_command('ffmpeg','macos',{},[])
 
     def test_window_selection_filters_small_and_wrong_titles(self):
         items = [{'owner':'Edge','name':name,'w':w,'h':h}for name,w,h in [('game',1200,800),('game popup',100,100),('private',2000,1500)]]
@@ -97,6 +109,17 @@ class StreamTests(unittest.TestCase):
 
     def test_real_process_identity(self):
         self.assertTrue(s.process_birth(__import__('os').getpid()))
+
+    def test_encoder_that_ignores_termination_is_reaped(self):
+        command = "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); time.sleep(30)"
+        child = subprocess.Popen([sys.executable,'-u','-c',command],stdout=subprocess.PIPE,text=True)
+        self.addCleanup(lambda:child.poll() is None and child.kill())
+        self.assertEqual(child.stdout.readline().strip(),'ready')
+        start = time.monotonic()
+        s.terminate_process(child,grace=.1)
+        self.assertIsNotNone(child.poll())
+        self.assertLess(time.monotonic()-start,3)
+        child.stdout.close()
 
 
 if __name__=='__main__':

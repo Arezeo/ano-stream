@@ -8,7 +8,7 @@ This page replaces the original planning estimates; hardware performance, platfo
 | Credentials | Missing-key dry-run reporting, both outputs redacted, backup query handled; unit tests |
 | Process ownership | Birth identity required before stop; reused-PID regression test |
 | macOS geometry | Main-display bounds and pixel mode from CoreGraphics; secondary/cross-display windows rejected |
-| 1080p/60 | Supported explicit output request; real capture/encode verification required on the broadcast host |
+| 1080p/60 | Default output; mini hardware-only synthetic test encoded 240 H.264 frames over 4 seconds at 1920×1080/60. This is not proof of game capture FPS. |
 | Windows | Native window enumeration + gdigrab + NVENC implemented; native capture verification required |
 | Audio | Silent AAC stereo only; game audio and microphones are not captured |
 | Platform publishing | Requires stream keys and destination receipt; local process liveness is not proof |

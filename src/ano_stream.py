@@ -34,9 +34,9 @@ CONFIG = HOME/'destinations.json'
 STATE = HOME/'state.json'
 DEFAULT_DESTINATIONS = {
     'youtube': {'kind':'rtmp', 'url':'rtmps://a.rtmps.youtube.com:443/live2',
-                'key_file':'youtube', 'resolution':[1280,720], 'bitrate':'6000k'},
+                'key_file':'youtube', 'resolution':[1920,1080], 'bitrate':'6000k'},
     'twitch': {'kind':'rtmp', 'url':'rtmps://live.twitch.tv:443/app',
-               'key_file':'twitch', 'resolution':[1280,720], 'bitrate':'6000k'},
+               'key_file':'twitch', 'resolution':[1920,1080], 'bitrate':'6000k'},
 }
 
 
@@ -192,7 +192,7 @@ def resolution(value):
 
 
 def common_settings(targets, args):
-    sizes = {tuple(spec.get('resolution',[1280,720])) for _,spec,_ in targets}
+    sizes = {tuple(spec.get('resolution',[1920,1080])) for _,spec,_ in targets}
     rates = {spec.get('bitrate','6000k') for _,spec,_ in targets}
     if not args.resolution and len(sizes)>1:
         raise ValueError('Destinations disagree on resolution; set --resolution for a shared encode')
@@ -214,7 +214,7 @@ def mac_geometry(win):
     return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
 
 
-def make_command(executable, backend, win, targets, fps=30, size=(1280,720), bitrate='6000k', output=None, mac_crop=None):
+def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None):
     if backend=='windows':
         source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
         crop,encoder = '','h264_nvenc'
@@ -232,7 +232,7 @@ def make_command(executable, backend, win, targets, fps=30, size=(1280,720), bit
                '-maxrate',bitrate,'-bufsize',str(2*int(bitrate[:-1]))+bitrate[-1],
                '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
                '-progress','pipe:1','-stats_period','1','-nostats']
-    command += ['-preset','p4','-rc','cbr'] if backend=='windows' else ['-realtime','1']
+    command += ['-preset','p4','-rc','cbr'] if backend=='windows' else ['-realtime','1','-allow_sw','0']
     if output:
         command += ['-t',str(output[1]),'-f','matroska',str(output[0])]
     elif len(targets)==1:
@@ -293,7 +293,7 @@ def inspect_plan(args, publish=True):
     if publish:
         targets,missing,secrets = destinations(cfg,args.to,dry_run=args.dry_run)
     else:
-        targets,missing,secrets = [('preview',{'resolution':[1280,720],'bitrate':'6000k'},'')],[],[]
+        targets,missing,secrets = [('preview',{'resolution':[1920,1080],'bitrate':'6000k'},'')],[],[]
     size,rate = common_settings(targets,args)
     crop = mac_geometry(win) if backend=='macos' else None
     if backend=='macos':
@@ -315,6 +315,20 @@ def inspect_plan(args, publish=True):
     return plan,command,secrets
 
 
+def terminate_process(process, grace=3):
+    """Reap the owned encoder, including capture drivers that ignore SIGTERM."""
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=grace)
+
+
 def worker(args):
     request = read_json(HOME/'requests'/(args.run_id+'.json'))
     args = argparse.Namespace(**request)
@@ -333,17 +347,7 @@ def worker(args):
         signal.signal(signal.SIGTERM,terminate_worker)
     # Output duration alone cannot bound a capture device stuck before its first frame.
     def stop_stalled_preview():
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=3)
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        terminate_process(process)
     timer = threading.Timer(args.seconds+20,stop_stalled_preview) if preview else None
     if timer:
         timer.daemon = True
@@ -370,8 +374,7 @@ def worker(args):
     finally:
         if timer:
             timer.cancel()
-        if process.poll() is None:
-            process.terminate()
+        terminate_process(process)
 
 
 def launch(args):
@@ -429,7 +432,7 @@ def main():
         item.add_argument('--window',required=True)
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')
-        item.add_argument('--fps',type=int,choices=range(1,61),default=30,metavar='1..60')
+        item.add_argument('--fps',type=int,choices=range(1,61),default=60,metavar='1..60')
         item.add_argument('--resolution')
         item.add_argument('--bitrate')
         item.add_argument('--dry-run',action='store_true')

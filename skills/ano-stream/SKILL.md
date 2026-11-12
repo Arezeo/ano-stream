@@ -16,7 +16,7 @@ ano-stream up --window "Game window title" --to youtube,twitch --dry-run
 
 Use the actual game window, not an account dashboard or a whole desktop. Inspect the returned plan, credential readiness and selected source before live output. A dry-run neither captures nor broadcasts. It can show missing keys; that does not establish destination readiness.
 
-Default output is 1280×720 at 30 FPS. Read [the workflow](../../docs/WORKFLOW.md) for host setup, credentials and source verification. Capture dimensions and observed FPS must be checked independently of output settings. Keep broadcast overlays separate from what the model sees.
+Default broadcast output is 1920×1080 at 60 FPS. Read [the workflow](../../docs/WORKFLOW.md) for host setup, credentials and source verification. Capture dimensions and observed FPS must be checked independently of output settings. Keep broadcast overlays separate from what the model sees; this output setting does not change model input dimensions or inference frequency.
 
 The helper shares one encoded video stream across comma-separated destinations. All selected destinations must agree on resolution and bitrate, or use explicit common `--resolution` and `--bitrate` overrides. Each destination still consumes upload bandwidth. YouTube's backup ingest is redundancy, not a Twitch output.
 
