@@ -41,6 +41,11 @@ python -B bin/ano-stream devices
 
 WSL may invoke an installed native `python.exe` with Windows paths. Linux FFmpeg `x11grab` is not a substitute for Windows window capture. Capture uses the selected window handle rather than a whole desktop or first title match.
 
+## Duration and bitrate
+
+- **Auto-stop:** a live broadcast ends by itself after `--max-hours` (default 3; `0` = no limit, maximum 48). Preview is unaffected. YouTube archives and rewinds streams only up to 12 hours; Twitch caps one broadcast at 48 hours.
+- **Bitrate:** YouTube's encoder guidance for H.264 at 1080p60 is 6 Mbps minimum, 17 Mbps recommended, constant bitrate, keyframe every 2 s. The macOS VideoToolbox encoder spends almost nothing on a still picture (measured about 0.35-0.47 Mbps for a static page at a 6-17 Mbps target, with or without `-constant_bit_rate`), so use `--cbr` with `--bitrate 17000k` to send the full rate: it encodes with x264 and pads with filler (measured 17.0 Mbps on a still image, roughly 1.6 CPU cores). That is about 7.6 GB of upload per hour. Twitch's ingest accepts far less (about 6-8 Mbps), so when one encode feeds both, pick a rate Twitch accepts.
+
 ## Local preview
 
 Open the production game page on the capture computer, select the game, and pair it with the inference runner. When moving a single-peer connection to a new browser, disconnect the old browser first; do not restart inference solely to change browsers.
