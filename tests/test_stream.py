@@ -160,7 +160,7 @@ class StreamTests(unittest.TestCase):
         with patch.object(s,'ffmpeg_path',return_value='ffmpeg'),patch.object(s,'capture_tool',return_value=Path('/x/window-capture')),\
              patch.object(s,'helper',return_value=Path('/x/os-helper')),patch.object(s.subprocess,'check_output',return_value='{"screen_recording": true}'):
             plan,cmd,_ = s.inspect_plan(args,publish=False)
-        self.assertEqual(plan['capture_command'][:2],['/x/window-capture','--pick'])
+        self.assertEqual(plan['capture_command'][:2],[str(Path('/x/window-capture')),'--pick'])
         self.assertNotIn('--match',plan['capture_command'])
         self.assertIn('pipe:0',cmd)
         args.capture='screen-crop'
