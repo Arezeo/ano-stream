@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.build/
+dist/
+runtime/
+keys/
+state.json
+*.log
+*.mp4
+*.mkv
+*.flv
+*.gguf
+skills/game-restart/scripts/os-helper
+packages/

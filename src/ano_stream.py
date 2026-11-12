@@ -1,0 +1,468 @@
+"""One window capture, one hardware encode, multiple RTMP destinations."""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import getpass
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import urlsplit, urlunsplit
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_home():
+    if platform.system() == 'Darwin':
+        return Path.home()/'Library/Application Support/ANOStreaming'
+    if os.name == 'nt':
+        return Path(os.environ.get('LOCALAPPDATA', str(Path.home())))/'ANOStreaming'
+    return Path.home()/'.local/state/ano-stream'
+
+
+HOME = Path(os.environ.get('ANO_STREAM_HOME', default_home()))
+CONFIG = HOME/'destinations.json'
+STATE = HOME/'state.json'
+DEFAULT_DESTINATIONS = {
+    'youtube': {'kind':'rtmp', 'url':'rtmps://a.rtmps.youtube.com:443/live2',
+                'key_file':'youtube', 'resolution':[1280,720], 'bitrate':'6000k'},
+    'twitch': {'kind':'rtmp', 'url':'rtmps://live.twitch.tv:443/app',
+               'key_file':'twitch', 'resolution':[1280,720], 'bitrate':'6000k'},
+}
+
+
+def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+    temp.write_text(json.dumps(data, indent=2)+'\n', encoding='utf-8')
+    temp.replace(path)
+
+
+def read_json(path, fallback=None):
+    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else fallback
+
+
+def init_home():
+    HOME.mkdir(parents=True, exist_ok=True)
+    (HOME/'keys').mkdir(exist_ok=True)
+    (HOME/'logs').mkdir(exist_ok=True)
+    if os.name != 'nt':
+        HOME.chmod(0o700)
+        (HOME/'keys').chmod(0o700)
+    if not CONFIG.exists():
+        write_json(CONFIG, DEFAULT_DESTINATIONS)
+    if not STATE.exists():
+        write_json(STATE, {'runs':[]})
+
+
+def key_path(name):
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+        raise ValueError('key_file must be a simple name inside the keys directory')
+    return HOME/'keys'/name
+
+
+def destinations(cfg, names, dry_run=False):
+    targets, missing, secrets = [], [], []
+    for name in dict.fromkeys(n.strip() for n in names.split(',') if n.strip()):
+        if name not in cfg:
+            raise ValueError('Unknown destination: '+name)
+        spec = dict(cfg[name])
+        base = spec.get('url', '')
+        parsed = urlsplit(base)
+        if parsed.scheme not in ('rtmp','rtmps') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError('Invalid RTMP server for '+name)
+        key = None
+        if spec.get('key_file'):
+            path = key_path(spec['key_file'])
+            key = path.read_text(encoding='utf-8').strip() if path.exists() else None
+            if key and re.search(r'[\s|\[\]\\]',key):
+                raise ValueError('Unsupported characters in stream key for '+name)
+            if not key:
+                missing.append(name)
+                if not dry_run:
+                    raise ValueError('Missing key for '+name+'; use: ano-stream key set '+name)
+                key = 'MISSING_KEY_'+name
+            else:
+                secrets.append(key)
+        path = parsed.path.rstrip('/')+('/'+key if key else '')
+        url = urlunsplit((parsed.scheme,parsed.netloc,path,parsed.query,''))
+        targets.append((name,spec,url))
+        secrets.append(url)
+    if not targets:
+        raise ValueError('Choose at least one destination')
+    if len({s.get('kind')=='rtmp-vertical' for _,s,_ in targets})>1:
+        raise ValueError('Mixed orientations require separate captures; choose one orientation')
+    return targets, missing, secrets
+
+
+def redact(text, secrets):
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret,'<redacted>')
+    return re.sub(r'rtmps?://[^\s|\]]+', '<redacted-rtmp-url>', text)
+
+
+def ffmpeg_path():
+    value = os.environ.get('ANO_STREAM_FFMPEG') or shutil.which('ffmpeg')
+    if not value or not Path(value).is_file():
+        raise ValueError('FFmpeg not found; set ANO_STREAM_FFMPEG to the native executable')
+    return str(Path(value).resolve())
+
+
+def native_windows():
+    if os.name != 'nt':
+        raise ValueError('Windows capture requires native Windows Python, not WSL Python')
+    from ctypes import wintypes
+    user = ctypes.windll.user32
+    try:
+        user.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+    class Rect(ctypes.Structure):
+        _fields_ = [(k,wintypes.LONG)for k in ('left','top','right','bottom')]
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
+    user.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user.GetWindowTextW.argtypes = [wintypes.HWND,wintypes.LPWSTR,ctypes.c_int]
+    user.GetWindowRect.argtypes = [wintypes.HWND,ctypes.POINTER(Rect)]
+    user.IsWindowVisible.argtypes = [wintypes.HWND]
+    user.IsIconic.argtypes = [wintypes.HWND]
+    user.EnumWindows.argtypes = [callback_type,wintypes.LPARAM]
+    found = []
+    @callback_type
+    def visit(hwnd,_):
+        if not user.IsWindowVisible(hwnd) or user.IsIconic(hwnd):
+            return True
+        n = user.GetWindowTextLengthW(hwnd)
+        if n:
+            title = ctypes.create_unicode_buffer(n+1)
+            user.GetWindowTextW(hwnd,title,n+1)
+            rect = Rect()
+            if user.GetWindowRect(hwnd,ctypes.byref(rect)):
+                found.append({'id':int(hwnd),'owner':'Windows','name':title.value,
+                              'x':rect.left,'y':rect.top,'w':rect.right-rect.left,'h':rect.bottom-rect.top})
+        return True
+    user.EnumWindows(visit,0)
+    return found
+
+
+def helper():
+    value = os.environ.get('ANO_HELPER')
+    path = Path(value) if value else HOME/'tools/os-helper'
+    if not path.is_file():
+        raise ValueError('Build the macOS os-helper into ANO_STREAM_HOME/tools; see docs/WORKFLOW.md')
+    return path
+
+
+def windows(backend):
+    if backend=='windows':
+        return native_windows()
+    if backend=='macos':
+        return json.loads(subprocess.check_output([str(helper()),'windows'],text=True,timeout=10))
+    raise ValueError('Window capture supports macOS and native Windows only')
+
+
+def choose_window(items, match):
+    candidates = [w for w in items if w['w']>320 and w['h']>200
+                  and match.casefold() in (w['owner']+' '+w['name']).casefold()]
+    if not candidates:
+        raise ValueError('No visible window matches '+repr(match)+'; run ano-stream devices')
+    return max(candidates,key=lambda w:w['w']*w['h'])
+
+
+def backend_name(value='auto'):
+    return ('windows' if os.name=='nt' else 'macos' if platform.system()=='Darwin' else 'unsupported') if value=='auto' else value
+
+
+def resolution(value):
+    if not re.fullmatch(r'[1-9][0-9]*x[1-9][0-9]*',value):
+        raise ValueError('Resolution must be WIDTHxHEIGHT')
+    w,h = map(int,value.split('x'))
+    if min(w,h)<16 or max(w,h)>7680 or w%2 or h%2:
+        raise ValueError('Resolution must use even dimensions from 16 to 7680')
+    return [w,h]
+
+
+def common_settings(targets, args):
+    sizes = {tuple(spec.get('resolution',[1280,720])) for _,spec,_ in targets}
+    rates = {spec.get('bitrate','6000k') for _,spec,_ in targets}
+    if not args.resolution and len(sizes)>1:
+        raise ValueError('Destinations disagree on resolution; set --resolution for a shared encode')
+    if not args.bitrate and len(rates)>1:
+        raise ValueError('Destinations disagree on bitrate; set --bitrate for a shared encode')
+    size = resolution(args.resolution) if args.resolution else resolution('x'.join(map(str,next(iter(sizes)))))
+    rate = args.bitrate or next(iter(rates))
+    if not re.fullmatch(r'[1-9][0-9]*[kM]',rate):
+        raise ValueError('Bitrate must be a positive value such as 6000k')
+    return size,rate
+
+
+def mac_geometry(win):
+    displays = json.loads(subprocess.check_output([str(helper()),'displays'],text=True,timeout=10))
+    main = next((d for d in displays if d['main']),None)
+    if not main or win['x']<main['x'] or win['y']<main['y'] or win['x']+win['w']>main['x']+main['w'] or win['y']+win['h']>main['y']+main['h']:
+        raise ValueError('This macOS backend requires the entire window on the main display')
+    sx,sy = main['pixel_w']/main['w'],main['pixel_h']/main['h']
+    return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
+
+
+def make_command(executable, backend, win, targets, fps=30, size=(1280,720), bitrate='6000k', output=None, mac_crop=None):
+    if backend=='windows':
+        source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
+        crop,encoder = '','h264_nvenc'
+    else:
+        source = ['-f','avfoundation','-capture_cursor','0','-framerate',str(fps),'-i','Capture screen 0']
+        if not mac_crop:
+            raise ValueError('macOS capture requires verified display geometry')
+        x,y,w,h = mac_crop
+        crop,encoder = f'crop={w}:{h}:{x}:{y},','h264_videotoolbox'
+    w,h = size
+    vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
+    command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,
+               '-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100',
+               '-map','0:v:0','-map','1:a:0','-vf',vf,'-c:v',encoder,'-b:v',bitrate,
+               '-maxrate',bitrate,'-bufsize',str(2*int(bitrate[:-1]))+bitrate[-1],
+               '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
+               '-progress','pipe:1','-stats_period','1','-nostats']
+    command += ['-preset','p4','-rc','cbr'] if backend=='windows' else ['-realtime','1']
+    if output:
+        command += ['-t',str(output[1]),'-f','matroska',str(output[0])]
+    elif len(targets)==1:
+        command += ['-f','flv',targets[0][2]]
+    else:
+        slaves = '|'.join('[f=flv:onfail=ignore]'+url.replace('\\','\\\\').replace("'", "'\\''")for _,_,url in targets)
+        command += ['-f','tee','-use_fifo','1','-fifo_options','attempt_recovery=1:recover_any_error=1:recovery_wait_time=2',slaves]
+    return command
+
+
+def process_birth(pid):
+    if os.name=='nt':
+        kernel = ctypes.WinDLL('kernel32',use_last_error=True)
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32,ctypes.c_int,ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.GetProcessTimes.argtypes = [ctypes.c_void_p,*([ctypes.c_void_p]*4)]
+        handle = kernel.OpenProcess(0x1000,0,int(pid))
+        if not handle:
+            return None
+        try:
+            times = [ctypes.c_uint64()for _ in range(4)]
+            if not kernel.GetProcessTimes(handle,*(ctypes.byref(t)for t in times)):
+                return None
+            return str(times[0].value)
+        finally:
+            kernel.CloseHandle(handle)
+    path = Path('/proc')/str(pid)/'stat'
+    try:
+        if path.exists():
+            return path.read_text().rsplit(')',1)[1].split()[19]
+        out = subprocess.run(['ps','-p',str(pid),'-o','lstart='],capture_output=True,text=True,timeout=3)
+        return out.stdout.strip() or None
+    except OSError:
+        return None
+
+
+def owned(run):
+    return bool(run.get('birth') and process_birth(run['pid'])==run['birth'])
+
+
+def stop_owned(run):
+    if not owned(run):
+        return False
+    if os.name=='nt':
+        subprocess.run(['taskkill','/PID',str(run['pid']),'/T','/F'],capture_output=True,timeout=10,check=True)
+    else:
+        os.killpg(run['pid'],signal.SIGTERM)
+    return True
+
+
+def inspect_plan(args, publish=True):
+    backend = backend_name(args.backend)
+    win = choose_window(windows(backend),args.window)
+    cfg = read_json(CONFIG)
+    if cfg is None:
+        raise ValueError('No config; run ano-stream init')
+    if publish:
+        targets,missing,secrets = destinations(cfg,args.to,dry_run=args.dry_run)
+    else:
+        targets,missing,secrets = [('preview',{'resolution':[1280,720],'bitrate':'6000k'},'')],[],[]
+    size,rate = common_settings(targets,args)
+    crop = mac_geometry(win) if backend=='macos' else None
+    if backend=='macos':
+        access = json.loads(subprocess.check_output([str(helper()),'permissions'],text=True,timeout=10))
+        if not access.get('screen_recording') and not args.dry_run:
+            raise ValueError('Screen Recording permission is not granted on this Mac; allow the capture process in System Settings > Privacy & Security > Screen & System Audio Recording')
+    output = (HOME/'previews'/(args.run_id+'.mkv'),args.seconds) if not publish else None
+    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop)
+    plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
+            'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
+            'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
+            'audio':'Silent stereo; game/microphone capture is not enabled',
+            'one_encode':True,'command':[redact(a,secrets)for a in command],
+            'observed_capture_fps':None,'platform_receipt':'unknown'}
+    if backend=='macos':
+        plan['screen_recording_permission'] = access.get('screen_recording',False)
+    if output:
+        plan['preview_file'] = str(output[0])
+    return plan,command,secrets
+
+
+def worker(args):
+    request = read_json(HOME/'requests'/(args.run_id+'.json'))
+    args = argparse.Namespace(**request)
+    plan,command,secrets = inspect_plan(args,publish=args.mode=='up')
+    preview = plan.get('preview_file')
+    if preview:
+        Path(preview).parent.mkdir(parents=True,exist_ok=True)
+    logfile = HOME/'logs'/(args.run_id+'.log')
+    progressfile = HOME/'logs'/(args.run_id+'-progress.json')
+    creation = {'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
+    process = subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',**creation)
+    # Output duration alone cannot bound a capture device stuck before its first frame.
+    def stop_stalled_preview():
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    timer = threading.Timer(args.seconds+20,stop_stalled_preview) if preview else None
+    if timer:
+        timer.daemon = True
+        timer.start()
+    def errors():
+        with logfile.open('a',encoding='utf-8')as log:
+            for line in process.stderr:
+                log.write(redact(line,secrets))
+                log.flush()
+    thread = threading.Thread(target=errors,daemon=True)
+    thread.start()
+    try:
+        frame = {}
+        for line in process.stdout:
+            key,_,value = line.strip().partition('=')
+            frame[key] = value
+            if key=='progress':
+                write_json(progressfile,{'at':time.time(),'encoder':frame})
+                frame = {}
+        code = process.wait()
+        thread.join(timeout=2)
+        write_json(HOME/'logs'/(args.run_id+'-exit.json'),{'at':time.time(),'code':code,'platform_receipt':'unknown','preview_file':preview})
+        return code
+    finally:
+        if timer:
+            timer.cancel()
+        if process.poll() is None:
+            process.terminate()
+
+
+def launch(args):
+    init_home()
+    state = read_json(STATE,{'runs':[]})
+    if any(owned(run)for run in state['runs']):
+        raise ValueError('An ano-stream process is already running; use status or down first')
+    args.run_id = str(int(time.time()))+'-'+uuid.uuid4().hex[:8]
+    plan,_,_ = inspect_plan(args,publish=args.mode=='up')
+    if args.dry_run:
+        return plan
+    if args.mode=='up' and not args.live:
+        raise ValueError('Publishing requires --live. Inspect --dry-run first.')
+    requests = HOME/'requests'
+    requests.mkdir(exist_ok=True)
+    write_json(requests/(args.run_id+'.json'),vars(args))
+    kwargs = {'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP|subprocess.DETACHED_PROCESS} if os.name=='nt' else {'start_new_session':True}
+    with (HOME/'logs'/(args.run_id+'-worker.log')).open('ab')as log:
+        process = subprocess.Popen([sys.executable,str(ROOT/'bin/ano-stream'),'_worker','--run-id',args.run_id],
+                   stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,**kwargs)
+    run = {'id':args.run_id,'pid':process.pid,'birth':process_birth(process.pid),'started':time.time(),
+           'mode':args.mode,'plan':plan,'worker_log':str(HOME/'logs'/(args.run_id+'-worker.log'))}
+    if not run['birth']:
+        process.terminate()
+        raise ValueError('Could not establish child process identity')
+    write_json(STATE,{'runs':[run]})
+    time.sleep(.5)
+    if process.poll() is not None:
+        raise ValueError('Worker exited during startup; inspect '+run['worker_log'])
+    return {'worker_started':True,'run':run,'platform_receipt':'unknown; not proof of live broadcast'}
+
+
+def status():
+    state = read_json(STATE,{'runs':[]})
+    for run in state['runs']:
+        run['running'] = owned(run)
+        run['progress'] = read_json(HOME/'logs'/(run['id']+'-progress.json'))
+        run['exit'] = read_json(HOME/'logs'/(run['id']+'-exit.json'))
+    return state
+
+
+def main():
+    if os.name!='nt':
+        os.umask(0o077)
+    parser = argparse.ArgumentParser(prog='ano-stream',description=__doc__)
+    sub = parser.add_subparsers(dest='mode',required=True)
+    sub.add_parser('init')
+    device = sub.add_parser('devices')
+    device.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
+    key = sub.add_parser('key')
+    key.add_argument('operation',choices=['set'])
+    key.add_argument('destination')
+    for name in ('up','preview'):
+        item = sub.add_parser(name)
+        item.add_argument('--window',required=True)
+        item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
+        item.add_argument('--to',default='youtube')
+        item.add_argument('--fps',type=int,choices=range(1,61),default=30,metavar='1..60')
+        item.add_argument('--resolution')
+        item.add_argument('--bitrate')
+        item.add_argument('--dry-run',action='store_true')
+        item.add_argument('--live',action='store_true',help='Publish to the selected destinations (up only)')
+        item.add_argument('--seconds',type=int,choices=range(1,61),default=3,metavar='1..60')
+    sub.add_parser('status').add_argument('--json',action='store_true')
+    sub.add_parser('down')
+    internal = sub.add_parser('_worker',help=argparse.SUPPRESS)
+    internal.add_argument('--run-id',required=True)
+    args = parser.parse_args()
+    try:
+        if args.mode=='init':
+            init_home()
+            result = {'config':str(CONFIG),'keys_dir':str(HOME/'keys'),'state_preserved':True}
+        elif args.mode=='key':
+            init_home()
+            cfg = read_json(CONFIG)
+            if args.destination not in cfg or not cfg[args.destination].get('key_file'):
+                raise ValueError('Destination does not have a key_file')
+            value = getpass.getpass('Stream key (hidden): ').strip()
+            if not value or re.search(r'[\s|\[\]\\]',value):
+                raise ValueError('Invalid key')
+            path = key_path(cfg[args.destination]['key_file'])
+            path.write_text(value+'\n',encoding='utf-8')
+            if os.name!='nt':
+                path.chmod(0o600)
+            result = {'key_saved':args.destination}
+        elif args.mode=='devices':
+            result = windows(backend_name(args.backend))
+        elif args.mode in ('up','preview'):
+            result = launch(args)
+        elif args.mode=='status':
+            result = status()
+        elif args.mode=='down':
+            state = read_json(STATE,{'runs':[]})
+            result = {'stopped':[r['pid']for r in state['runs']if stop_owned(r)],'inference_untouched':True}
+        else:
+            if not re.fullmatch(r'[0-9]+-[a-f0-9]{8}',args.run_id):
+                raise ValueError('Invalid run id')
+            return worker(args)
+        print(json.dumps(result,indent=2))
+        return 0
+    except (ValueError,OSError,subprocess.SubprocessError)as error:
+        print(json.dumps({'error':str(error)}),file=sys.stderr)
+        return 2

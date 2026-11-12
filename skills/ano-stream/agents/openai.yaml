@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Number One Streaming"
+  short_description: "Stream game windows with ano-stream on Mac or PC"
+  default_prompt: "Use $ano-stream to prepare and verify a broadcast from my selected computer."

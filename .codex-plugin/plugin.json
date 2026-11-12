@@ -1,0 +1,18 @@
+{
+  "name": "ano-stream",
+  "version": "0.2.0",
+  "description": "Prepare and verify game broadcasts with the local ano-stream helper on macOS or Windows.",
+  "author": { "name": "Arezeo", "url": "https://agentnumberone.io" },
+  "homepage": "https://agentnumberone.io",
+  "repository": "https://github.com/Arezeo/ano-stream",
+  "skills": "./skills/",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "Agent Number One Streaming",
+    "shortDescription": "Stream game windows to YouTube and Twitch.",
+    "defaultPrompt": [
+      "Prepare a dry-run broadcast of my game with ano-stream.",
+      "Stream my game from the PC to YouTube and Twitch."
+    ]
+  }
+}

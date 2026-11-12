@@ -1,0 +1,89 @@
+# Broadcast workflow
+
+Choose the broadcast computer first. A useful split is **Mac mini: game browser + capture/encode/upload; PC: model inference**. The game browser connects to the PC's authenticated WebRTC endpoint. Broadcasting and inference are independently started and stopped. A MacBook used to coordinate over SSH is not in the media path.
+
+The current requested broadcast target is **1920×1080 at 60 FPS**. Keep the model's capture/input settings independent; a 60 FPS broadcast does not imply 60 model decisions per second.
+
+## Install
+
+Clone this repository on the capture computer and install Python 3.10+ and a native FFmpeg with the required device/encoder. No Python packages are needed by the streaming CLI. Keep compiled helpers and runtime files outside synced source trees.
+
+### macOS
+
+```sh
+export ANO_STREAM_HOME="$HOME/Library/Application Support/ANOStreaming"
+export ANO_STREAM_FFMPEG=/opt/homebrew/bin/ffmpeg
+mkdir -p "$ANO_STREAM_HOME/tools" "$ANO_STREAM_HOME/cache/swift"
+swiftc -O -module-cache-path "$ANO_STREAM_HOME/cache/swift" \
+  skills/game-restart/scripts/os-helper.swift -o "$ANO_STREAM_HOME/tools/os-helper"
+python3 bin/ano-stream init
+python3 bin/ano-stream devices
+```
+
+Screen Recording permission is required for the capture process; a user must grant macOS permission when prompted. AVFoundation captures the main display and crops it to the selected window. Keep that window fully on the main display, unobscured and stationary. This backend does not provide isolated capture of an occluded window. The helper's logical/pixel display geometry determines the crop; it does not infer Retina scale from a screenshot.
+
+### Windows
+
+Use native Windows Python and FFmpeg, even if coordinating through WSL. A Windows graphical session and a visible, non-minimized game window are required. The current Windows encoder is NVIDIA NVENC. Do not fall back silently to CPU encoding if unavailable.
+
+```powershell
+$env:ANO_STREAM_HOME = 'E:\AgentNumberOne\streaming\runtime'
+$env:ANO_STREAM_FFMPEG = 'E:\tools\ffmpeg\bin\ffmpeg.exe' # actual installed path
+python -B bin/ano-stream init
+python -B bin/ano-stream devices
+```
+
+WSL may invoke an installed native `python.exe` with Windows paths. Linux FFmpeg `x11grab` is not a substitute for Windows window capture. Capture uses the selected window handle rather than a whole desktop or first title match.
+
+## Local preview
+
+Open the production game page on the capture computer, select the game, and pair it with the inference runner. When moving a single-peer connection to a new browser, disconnect the old browser first; do not restart inference solely to change browsers.
+
+```sh
+python3 bin/ano-stream preview --window "Game window" --resolution 1920x1080 --fps 60 --seconds 3
+python3 bin/ano-stream status --json
+```
+
+Open the returned `preview_file`. Verify the intended game is visible and read dimensions/FPS from FFprobe. FFmpeg progress includes encoded frame count, reported FPS, output time and dropped/duplicated frames where available. Configured FPS and metadata are not proof of genuinely fresh source frames at that rate. This preview has silent audio; game audio is not implemented yet.
+
+If frame/input timing is used for model supervision, perform a separate real calibration with a visible input effect and source timestamps. A 60 FPS encode does not establish calibrated demonstration timing.
+
+## Destinations and keys
+
+`init` creates `destinations.json` and preserves existing configuration/state. Keys are entered through concealed input:
+
+```sh
+python3 bin/ano-stream key set youtube
+python3 bin/ano-stream key set twitch
+```
+
+Use current ingest addresses from each platform. YouTube supplies primary and backup ingest addresses plus a separate stream key; the backup is optional redundancy, not the Twitch output. The helper appends a key before a server URL's query string. Default destinations use RTMPS. Set visibility in the platform's event/dashboard before starting a public output.
+
+The requested channels are configured locally, not embedded as credentials or assumed to be signed in by this repository. Choose shared resolution/bitrate explicitly when existing destination configurations differ.
+
+```sh
+python3 bin/ano-stream up --window "Game window" --to youtube,twitch \
+  --resolution 1920x1080 --fps 60 --bitrate 6000k --dry-run
+```
+
+A successful dry-run is a prepared command, not an ingest test. Missing keys are allowed for planning and clearly reported. Publishing requires `--live` and valid keys:
+
+```sh
+python3 bin/ano-stream up --window "Game window" --to youtube,twitch \
+  --resolution 1920x1080 --fps 60 --bitrate 6000k --live
+```
+
+Inspect YouTube/Twitch's own ingest health and actual watch pages before reporting success. Check [Twitch's current simulcasting terms](https://www.twitch.tv/p/terms-of-service#11-simulcasting), [YouTube encoder guidance](https://support.google.com/youtube/answer/2853702?hl=en), and [Twitch ingest documentation](https://dev.twitch.tv/docs/video-broadcast/). Two direct 6 Mbps video outputs consume about 12 Mbps plus audio/protocol overhead. No paid relay is configured.
+
+## Metrics and stop
+
+```sh
+python3 bin/ano-stream status --json
+python3 bin/ano-stream down
+```
+
+`status` reports owned process liveness, redacted plan, encoder progress and exit status. It does not query platform receipt or measure viewer delay. Progress timestamps establish freshness; stale metrics from an exited process are not current performance.
+
+Compare the same model/settings before and during broadcasting: inference median/P95, generated tokens/s, actual model completions/s, received video FPS, input events sent, GPU/VRAM/CPU/RAM and network throughput. Keep policy/playback callbacks separate from model completions and successfully applied browser inputs. Successful action application remains unknown when the protocol supplies no acknowledgement.
+
+`down` verifies process identity before stopping its own process tree. It leaves the model runner and game state alone. Multiple simultaneous `up` invocations are not supported; start one command at a time.
