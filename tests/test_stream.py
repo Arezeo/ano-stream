@@ -154,6 +154,21 @@ class StreamTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'id 2'):
             s.choose_window(items,'Safari',2)
 
+    def test_pick_mode_needs_no_window_and_never_runs_the_screen_crop_path(self):
+        args = argparse.Namespace(window=None,pick=True,backend='macos',capture='window',window_id=None,to='youtube',
+                                  fps=60,resolution='1920x1080',bitrate=None,dry_run=True,seconds=3,mode='preview',run_id='x')
+        with patch.object(s,'ffmpeg_path',return_value='ffmpeg'),patch.object(s,'capture_tool',return_value=Path('/x/window-capture')),\
+             patch.object(s,'helper',return_value=Path('/x/os-helper')),patch.object(s.subprocess,'check_output',return_value='{"screen_recording": true}'):
+            plan,cmd,_ = s.inspect_plan(args,publish=False)
+        self.assertEqual(plan['capture_command'][:2],['/x/window-capture','--pick'])
+        self.assertNotIn('--match',plan['capture_command'])
+        self.assertIn('pipe:0',cmd)
+        args.capture='screen-crop'
+        with self.assertRaisesRegex(ValueError,'--pick needs'):
+            s.inspect_plan(args,publish=False)
+        args.capture,args.pick,args.window = 'window',False,None
+        with self.assertRaisesRegex(ValueError,'--window TEXT'):
+            s.inspect_plan(args,publish=False)
 
 if __name__=='__main__':
     unittest.main()
