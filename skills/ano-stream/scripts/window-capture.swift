@@ -72,6 +72,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var warnedIdle = false
     var sent = 0
     var streamStopped = false
+    var blank = false
+    var zeros = [UInt8](repeating: 0, count: width * height * 4)
     var packed = [UInt8](repeating: 0, count: width * height * 4)
     let writeQueue = DispatchQueue(label: "ano.window-capture.write")
     var timer: DispatchSourceTimer?
@@ -103,6 +105,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         return streamStopped
     }
 
+    /// While no matching window is capturable, send black frames and drop the last real frame
+    /// so nothing stale (or from a window that stopped matching) is ever broadcast.
+    func setBlank(_ value: Bool) {
+        lock.lock(); blank = value; if value { latest = nil }; lock.unlock()
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("capture stream stopped: \(error.localizedDescription)")
         setStopped(true)
@@ -111,12 +119,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     func emit() {
         lock.lock()
         let pixels = latest
+        let showBlank = blank
         let idle = Date().timeIntervalSince(lastFrameAt)
         if idle > 5 && !warnedIdle {
             warnedIdle = true
             log("no new frame for 5s (window minimized, hidden or on another Space?); repeating last frame")
         }
         lock.unlock()
+        if showBlank {
+            let wroteBlank = zeros.withUnsafeBytes { fwrite($0.baseAddress, 1, $0.count, stdout) }
+            if wroteBlank != zeros.count || fflush(stdout) != 0 { exit(6) }
+            return
+        }
         guard let pixels else { return }
         CVPixelBufferLockBaseAddress(pixels, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixels, .readOnly) }
@@ -211,6 +225,7 @@ func begin(_ window: SCWindow) async throws -> Session {
     try stream.addStreamOutput(capture, type: .screen, sampleHandlerQueue: DispatchQueue(label: "ano.window-capture.frames"))
     try await stream.startCapture()
     capture.setStopped(false)
+    capture.setBlank(false)
     log("capturing \(describe(window)) at \(width)x\(height)@\(fps)")
     return Session(window: window, stream: stream, filter: filter, config: config)
 }
@@ -220,33 +235,36 @@ Task {
     var lostSince: Date?
     capture.startTimer()
     while true {
-        let stopped = capture.isStopped()
-        let quiet = capture.secondsSinceFrame() > 3
-        if session == nil || stopped || quiet {
-            let target = await resolveWindow()
-            if let target, session == nil || stopped || target.windowID != session!.window.windowID {
-                if let old = session { try? await old.stream.stopCapture() }
-                session = nil
-                do { session = try await begin(target) }
-                catch { log("could not start capture of \(describe(target)): \(error.localizedDescription)") }
+        // Every second, confirm the captured window still matches. A window whose title no
+        // longer matches (for example its tab was switched to another page) is dropped at once.
+        let target = await resolveWindow()
+        if target == nil {
+            if let old = session { try? await old.stream.stopCapture(); session = nil }
+            capture.setBlank(true)
+        } else if let target, session == nil || capture.isStopped() || target.windowID != session!.window.windowID {
+            if let old = session { try? await old.stream.stopCapture() }
+            session = nil
+            do { session = try await begin(target) }
+            catch {
+                log("could not start capture of \(describe(target)): \(error.localizedDescription)")
+                capture.setBlank(true)
             }
-            if target == nil || session == nil {
-                if lostSince == nil {
-                    lostSince = Date()
-                    log("no capturable window matches \(windowID > 0 ? "id \(windowID)" : "\"\(match)\""); waiting up to 60s")
-                }
-                if Date().timeIntervalSince(lostSince!) > 60 {
-                    fail(4, "window not found for 60s; ending capture so the broadcast does not freeze on a stale frame")
-                }
-            } else {
-                lostSince = nil
+        }
+        if session == nil {
+            if lostSince == nil {
+                lostSince = Date()
+                log("no capturable window matches \(windowID > 0 ? "id \(windowID)" : "\"\(match)\""); sending black, waiting up to 60s")
             }
+            if Date().timeIntervalSince(lostSince!) > 60 {
+                fail(4, "window not found for 60s; ending capture")
+            }
+        } else {
+            lostSince = nil
         }
         // ScreenCaptureKit sends frames only when the window changes, so a static page can
         // produce none at all. Refresh from a screenshot while the stream is quiet.
         if let s = session, capture.secondsSinceFrame() > 0.9, let shot = await screenshot(s.filter, s.config) {
             capture.seed(shot)
-            lostSince = nil
         }
         try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
