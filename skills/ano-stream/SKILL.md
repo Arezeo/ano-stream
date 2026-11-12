@@ -5,7 +5,7 @@ description: Prepare, start, inspect or stop game broadcasts through ano-stream,
 
 Use this repository's `bin/ano-stream`. Run capture, encoding and publishing on the user's selected broadcast computer. Preserve their host choice; an SSH coordinator is not the broadcast host.
 
-Inspect `--help`, `devices` and `up --help` on that host. This version supports macOS window capture through AVFoundation and native Windows capture through gdigrab with NVENC. WSL's Linux screen is not the Windows desktop: run the helper with native Windows Python and FFmpeg when capturing Windows windows.
+Inspect `--help`, `devices` and `up --help` on that host. This version supports macOS single-window capture through ScreenCaptureKit (`tools/window-capture`; `--capture screen-crop` is the older display-crop fallback) and native Windows capture through gdigrab with NVENC. WSL's Linux screen is not the Windows desktop: run the helper with native Windows Python and FFmpeg when capturing Windows windows.
 
 Examples, after `init`:
 

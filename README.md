@@ -8,7 +8,7 @@ python3 bin/ano-stream devices
 python3 bin/ano-stream up --window Arc --to youtube --dry-run
 ```
 
-The CLI uses Python 3.10+ and FFmpeg. macOS uses AVFoundation and VideoToolbox; native Windows uses gdigrab and NVIDIA NVENC. Windows capture requires native Windows Python/FFmpeg, not Linux screen capture inside WSL. See [the workflow](docs/WORKFLOW.md) for installation and checks.
+The CLI uses Python 3.10+ and FFmpeg. macOS captures the selected window with ScreenCaptureKit (`--capture window`, default; `--capture screen-crop` keeps the older AVFoundation display grab) and encodes with VideoToolbox; native Windows uses gdigrab and NVIDIA NVENC. Windows capture requires native Windows Python/FFmpeg, not Linux screen capture inside WSL. See [the workflow](docs/WORKFLOW.md) for installation and checks.
 
 ## Preview and simulcast
 

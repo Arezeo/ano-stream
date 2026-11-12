@@ -16,11 +16,17 @@ export ANO_STREAM_FFMPEG=/opt/homebrew/bin/ffmpeg
 mkdir -p "$ANO_STREAM_HOME/tools" "$ANO_STREAM_HOME/cache/swift"
 swiftc -O -module-cache-path "$ANO_STREAM_HOME/cache/swift" \
   skills/game-restart/scripts/os-helper.swift -o "$ANO_STREAM_HOME/tools/os-helper"
+swiftc -O -swift-version 5 -module-cache-path "$ANO_STREAM_HOME/cache/swift" \
+  skills/ano-stream/scripts/window-capture.swift -o "$ANO_STREAM_HOME/tools/window-capture"
 python3 bin/ano-stream init
 python3 bin/ano-stream devices
 ```
 
-Screen Recording permission is required for the capture process; a user must grant macOS permission when prompted. AVFoundation captures the main display and crops it to the selected window. Keep that window fully on the main display, unobscured and stationary. This backend does not provide isolated capture of an occluded window. The helper's logical/pixel display geometry determines the crop; it does not infer Retina scale from a screenshot.
+Screen Recording permission is required for the capture process; a user must grant macOS permission when prompted.
+
+**Default capture (`--capture window`)** uses ScreenCaptureKit through `tools/window-capture`, which captures only the selected window and pipes raw BGRA frames at a constant rate into the single FFmpeg encode. Overlapping windows, notifications and the menu bar never appear, and the window may be moved or covered. It still captures the whole window, including the browser's own tab strip and address bar, so for a page-only picture run the game in a chromeless app window (for example Chrome `--app=<url>`). The window is found by the `--window` text (app name and title) and found again if the app recreates it; if no matching window exists for 60 seconds the capture exits and the broadcast ends rather than freezing on a stale frame. Matching is by text, so make it specific (for example the game page's title) or a different window of the same app, including a personal one, could be captured. A minimized window, or one on another Space, stops delivering new frames; the tool warns and repeats the last frame. Window resizes are scaled into the original output size and are not re-cropped.
+
+**Legacy capture (`--capture screen-crop`)** records the main display with AVFoundation and crops it to the window's rectangle at launch. Keep that window fully on the main display, unobscured and stationary; it does not isolate an occluded window and does not follow a moved or resized one. The helper's logical/pixel display geometry determines the crop; it does not infer Retina scale from a screenshot.
 
 ### Windows
 

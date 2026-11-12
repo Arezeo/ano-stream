@@ -121,6 +121,29 @@ class StreamTests(unittest.TestCase):
         self.assertLess(time.monotonic()-start,3)
         child.stdout.close()
 
+    def test_fit_size_keeps_window_aspect_and_even_dimensions(self):
+        self.assertEqual(s.fit_size({'w':1000,'h':1000},(1920,1080)),[1080,1080])
+        for w,h in [(2204,1122),(1001,777),(333,999)]:
+            fitted = s.fit_size({'w':w,'h':h},(1920,1080))
+            self.assertTrue(all(v%2==0 for v in fitted))
+            self.assertLessEqual(fitted[0],1920)
+            self.assertLessEqual(fitted[1],1080)
+
+    def test_macos_window_capture_reads_raw_frames_from_stdin_not_the_screen(self):
+        cmd = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],window_size=(1920,976))
+        self.assertIn('pipe:0',cmd)
+        self.assertIn('rawvideo',cmd)
+        self.assertEqual(cmd[cmd.index('-video_size')+1],'1920x976')
+        self.assertNotIn('avfoundation',cmd)
+        self.assertFalse(any('Capture screen' in item or 'crop=' in item for item in cmd))
+        self.assertIn('h264_videotoolbox',cmd)
+        self.assertEqual(cmd[cmd.index('-colorspace')+1],'bt709')
+
+    def test_macos_screen_crop_is_still_available(self):
+        cmd = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],mac_crop=(0,60,4408,2244))
+        self.assertIn('Capture screen 0',cmd)
+        self.assertNotIn('pipe:0',cmd)
+
 
 if __name__=='__main__':
     unittest.main()
