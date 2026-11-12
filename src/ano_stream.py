@@ -309,7 +309,15 @@ def stop_owned(run):
 
 def inspect_plan(args, publish=True):
     backend = backend_name(args.backend)
-    win = choose_window(windows(backend),args.window,getattr(args,'window_id',None))
+    picking = bool(getattr(args,'pick',False))
+    if picking:
+        if backend!='macos' or getattr(args,'capture','window')!='window':
+            raise ValueError('--pick needs macOS window capture (--capture window)')
+        win = None
+    else:
+        if not args.window:
+            raise ValueError('Give --window TEXT, or --pick to choose in the macOS sharing picker')
+        win = choose_window(windows(backend),args.window,getattr(args,'window_id',None))
     cfg = read_json(CONFIG)
     if cfg is None:
         raise ValueError('No config; run ano-stream init')
@@ -318,6 +326,8 @@ def inspect_plan(args, publish=True):
     else:
         targets,missing,secrets = [('preview',{'resolution':[1920,1080],'bitrate':'6000k'},'')],[],[]
     size,rate = common_settings(targets,args)
+    if picking:
+        win = {'id':0,'owner':'macOS sharing picker','name':'chosen by you in the picker','x':0,'y':0,'w':size[0],'h':size[1]}
     window_capture = backend=='macos' and getattr(args,'capture','window')=='window'
     crop = mac_geometry(win) if backend=='macos' and not window_capture else None
     window_size = fit_size(win,size) if window_capture else None
@@ -328,16 +338,16 @@ def inspect_plan(args, publish=True):
     output = (HOME/'previews'/(args.run_id+'.mkv'),args.seconds) if not publish else None
     command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size)
     # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
-    capture_command = [str(capture_tool()),'--match',args.window,'--width',str(window_size[0]),
+    capture_command = [str(capture_tool()),'--pick' if picking else '--match',*([] if picking else [args.window]),'--width',str(window_size[0]),
                        '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
-    if capture_command and getattr(args,'window_id',None):
+    if capture_command and getattr(args,'window_id',None) and not picking:
         capture_command += ['--window-id',str(args.window_id)]
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
             'audio':'Silent stereo; game/microphone capture is not enabled',
             'one_encode':True,'command':[redact(a,secrets)for a in command],
-            'capture':'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)' if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
+            'capture':('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
             'capture_command':capture_command,
             'observed_capture_fps':None,'platform_receipt':'unknown'}
     if backend=='macos':
@@ -388,7 +398,7 @@ def worker(args):
         terminate_process(process)
         if capture:
             terminate_process(capture)
-    timer = threading.Timer(args.seconds+20,stop_stalled_preview) if preview else None
+    timer = threading.Timer(args.seconds+20+(60 if getattr(args,'pick',False) else 0),stop_stalled_preview) if preview else None
     if timer:
         timer.daemon = True
         timer.start()
@@ -473,7 +483,8 @@ def main():
     key.add_argument('destination')
     for name in ('up','preview'):
         item = sub.add_parser(name)
-        item.add_argument('--window',required=True)
+        item.add_argument('--window',help='Window text to match (app name and title); or use --pick')
+        item.add_argument('--pick',action='store_true',help='macOS: choose any window or screen in the system sharing picker (like Meet)')
         item.add_argument('--window-id',type=int,help='Pin one window id (from devices); the window must also match --window. Use when several windows of one app share a title.')
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')

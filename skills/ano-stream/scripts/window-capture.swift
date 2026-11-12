@@ -2,6 +2,7 @@
 //
 //   window-capture --match TEXT --width W --height H [--fps 60] [--frames N]
 //   window-capture --window-id ID --width W --height H [--fps 60] [--frames N]
+//   window-capture --pick --width W --height H [--fps 60]
 //   window-capture --check
 //
 // Writes raw BGRA frames (W*H*4 bytes each, no header) to stdout at a constant
@@ -14,6 +15,11 @@
 // (case-insensitive) and re-resolves it whenever the window is closed or
 // recreated. If no matching window is capturable for 60 s the tool exits, so a
 // dead window ends the broadcast instead of freezing on a stale frame.
+// --pick shows Apple's system sharing picker (the same one Meet and Zoom use): click any
+// window or screen. Nothing is sent until you choose, and you can change the shared
+// window later from the sharing control in the menu bar. Cancelling or stopping sharing
+// ends the capture.
+//
 // --window-id pins one window id for its whole life (no re-resolve). With both
 // --window-id and --match, the window must have that id AND a matching title.
 //
@@ -42,6 +48,7 @@ var height = 0
 var fps = 60
 var maxFrames = -1
 var checkOnly = false
+var pick = false
 
 var it = CommandLine.arguments.dropFirst().makeIterator()
 while let a = it.next() {
@@ -53,6 +60,7 @@ while let a = it.next() {
     case "--fps": fps = Int(it.next() ?? "") ?? 0
     case "--frames": maxFrames = Int(it.next() ?? "") ?? -1
     case "--check": checkOnly = true
+    case "--pick": pick = true
     default: fail(2, "usage: window-capture (--match TEXT | --window-id ID) --width W --height H [--fps N] [--frames N] | --check")
     }
 }
@@ -62,8 +70,8 @@ if !CGPreflightScreenCaptureAccess() {
     fail(3, "Screen Recording permission is not granted for the process that launched this tool")
 }
 if checkOnly { print("{\"screen_recording\":true}"); exit(0) }
-guard windowID > 0 || !match.isEmpty, width >= 16, height >= 16, width % 2 == 0, height % 2 == 0, (1...60).contains(fps) else {
-    fail(2, "need --match or --window-id, even --width/--height >= 16, and --fps 1..60")
+guard windowID > 0 || !match.isEmpty || pick, width >= 16, height >= 16, width % 2 == 0, height % 2 == 0, (1...60).contains(fps) else {
+    fail(2, "need --match, --window-id or --pick, even --width/--height >= 16, and --fps 1..60")
 }
 
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -211,14 +219,17 @@ func resolveWindow() async -> SCWindow? {
 let capture = Capture()
 
 struct Session {
-    let window: SCWindow
+    let window: SCWindow?
     let stream: SCStream
     let filter: SCContentFilter
     let config: SCStreamConfiguration
 }
 
 func begin(_ window: SCWindow) async throws -> Session {
-    let filter = SCContentFilter(desktopIndependentWindow: window)
+    try await begin(filter: SCContentFilter(desktopIndependentWindow: window), window: window, label: describe(window))
+}
+
+func begin(filter: SCContentFilter, window: SCWindow?, label: String) async throws -> Session {
     let config = SCStreamConfiguration()
     config.width = width
     config.height = height
@@ -233,8 +244,66 @@ func begin(_ window: SCWindow) async throws -> Session {
     try await stream.startCapture()
     capture.setStopped(false)
     capture.setBlank(false)
-    log("capturing \(describe(window)) at \(width)x\(height)@\(fps)")
+    log("capturing \(label) at \(width)x\(height)@\(fps)")
     return Session(window: window, stream: stream, filter: filter, config: config)
+}
+
+final class PickerObserver: NSObject, SCContentSharingPickerObserver {
+    var session: Session?
+
+    func describeFilter(_ filter: SCContentFilter) -> String {
+        let windows = filter.includedWindows.map(describe)
+        if !windows.isEmpty { return windows.joined(separator: ", ") }
+        return filter.includedDisplays.map { "display \($0.displayID)" }.joined(separator: ", ")
+    }
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
+        fail(4, stream == nil ? "nothing was chosen in the sharing picker" : "sharing was stopped")
+    }
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
+        Task {
+            do {
+                if let s = session {
+                    try await s.stream.updateContentFilter(filter)
+                    log("now sharing \(describeFilter(filter))")
+                } else {
+                    session = try await begin(filter: filter, window: nil, label: describeFilter(filter))
+                }
+            } catch {
+                fail(5, "could not start capture of the chosen content: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func contentSharingPickerStartDidFailWithError(_ error: Error) {
+        fail(5, "sharing picker failed: \(error.localizedDescription)")
+    }
+}
+
+if pick {
+    let observer = PickerObserver()
+    NSApplication.shared.setActivationPolicy(.accessory)
+    capture.startTimer()   // no frames are sent until something is chosen
+    Task { @MainActor in
+        var cfg = SCContentSharingPickerConfiguration()
+        cfg.allowedPickerModes = [.singleWindow, .singleDisplay]
+        cfg.allowsChangingSelectedContent = true
+        let picker = SCContentSharingPicker.shared
+        picker.add(observer)
+        picker.defaultConfiguration = cfg
+        picker.isActive = true
+        picker.present()
+        log("waiting for you to choose a window or screen in the macOS sharing picker")
+        while true {
+            if capture.isStopped() { fail(5, "capture stopped (sharing ended)") }
+            if let s = observer.session, capture.secondsSinceFrame() > 0.9, let shot = await screenshot(s.filter, s.config) {
+                capture.seed(shot)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+    NSApplication.shared.run()
 }
 
 Task {
@@ -248,7 +317,7 @@ Task {
         if target == nil {
             if let old = session { try? await old.stream.stopCapture(); session = nil }
             capture.setBlank(true)
-        } else if let target, session == nil || capture.isStopped() || target.windowID != session!.window.windowID {
+        } else if let target, session == nil || capture.isStopped() || target.windowID != session!.window?.windowID {
             if let old = session { try? await old.stream.stopCapture() }
             session = nil
             do { session = try await begin(target) }
