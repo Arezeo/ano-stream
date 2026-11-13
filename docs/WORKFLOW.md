@@ -55,7 +55,7 @@ python3 bin/ano-stream preview --window "Game window" --resolution 1920x1080 --f
 python3 bin/ano-stream status --json
 ```
 
-Open the returned `preview_file`. Verify the intended game is visible and read dimensions/FPS from FFprobe. FFmpeg progress includes encoded frame count, reported FPS, output time and dropped/duplicated frames where available. Configured FPS and metadata are not proof of genuinely fresh source frames at that rate. This preview has silent audio; game audio is not implemented yet.
+Open the returned `preview_file`. Verify the intended game is visible and read dimensions/FPS from FFprobe. FFmpeg progress includes encoded frame count, reported FPS, output time and dropped/duplicated frames where available. Configured FPS and metadata are not proof of genuinely fresh source frames at that rate. On macOS window capture the preview carries the shared app's audio (see "Audio and tab guard" below); Windows and `--capture screen-crop` are silent.
 
 If frame/input timing is used for model supervision, perform a separate real calibration with a visible input effect and source timestamps. A 60 FPS encode does not establish calibrated demonstration timing.
 
@@ -98,3 +98,22 @@ python3 bin/ano-stream down
 Compare the same model/settings before and during broadcasting: inference median/P95, generated tokens/s, actual model completions/s, received video FPS, input events sent, GPU/VRAM/CPU/RAM and network throughput. Keep policy/playback callbacks separate from model completions and successfully applied browser inputs. Successful action application remains unknown when the protocol supplies no acknowledgement.
 
 `down` verifies process identity before stopping its own process tree. It leaves the model runner and game state alone. Multiple simultaneous `up` invocations are not supported; start one command at a time.
+
+## Sharing one browser tab (recommended for the game)
+
+`--capture tab` works like sharing a tab in Google Meet. `ano-stream up --capture tab ...` starts a small relay on `127.0.0.1` and prints a one-time address (`tab_url`). Open that address in the browser profile that holds the game (a private window needs it opened in a private tab), press **Choose the tab to stream**, pick the game under **Chrome Tab** and tick **Also share tab audio**. The page records only that tab's picture and sound and uploads it to the relay, which feeds FFmpeg. Nothing is sent until you choose.
+
+- Opening other tabs, switching tabs or windows, or covering the game never changes the stream; only the shared tab is sent, with only its own sound.
+- Stopping the sharing in the browser, or closing the sharing page, ends the broadcast. `--max-hours` and `down` work as before.
+- The page refuses a window or screen choice and (unless `--no-audio`) a share without tab audio.
+- The address contains a random token and the relay accepts only `127.0.0.1`/`localhost` host names, so other sites cannot post into it.
+- It needs Chrome, Edge or Arc, and no Screen Recording permission. The browser re-encodes the tab to H.264 and FFmpeg encodes it again to the broadcast bitrate, so keep the sharing page's window open (it does not need to be visible).
+- The window picker modes below remain for sharing a window or a whole screen.
+
+## Audio and tab guard (macOS window capture)
+
+`window-capture` also records the shared app's audio through ScreenCaptureKit and hands it to FFmpeg over an inherited pipe (48 kHz stereo float, written at a constant rate, silence when nothing plays). Use `--no-audio` to send silence instead.
+
+ScreenCaptureKit exposes audio **per application**, not per tab or window. Every tab of the shared browser that is playing sound is included, even one in another window, so keep the management tabs (YouTube Studio, Twitch) muted. Capturing only one tab's sound would need a browser-tab capture inside the browser rather than ScreenCaptureKit.
+
+A window shows only its active tab, so opening a new tab in the shared window changes what is streamed. `--pick --guard TEXT` prevents that from leaking: the title of the shared window must contain TEXT (for example `--guard "AGENT NUMBER ONE"`). While it does not, the picture is black and the audio silent; both return when the title matches again. The title is checked four times a second, so a tab switch can show for a fraction of a second first. The cleanest setup is a dedicated window that holds only the game tab, with every other tab opened in a different window. `--guard` needs `--pick` and a shared window (not a screen).

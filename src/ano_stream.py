@@ -1,4 +1,4 @@
-"""One window capture, one hardware encode, multiple RTMP destinations."""
+"""One window or browser-tab capture, one encode, multiple RTMP destinations."""
 from __future__ import annotations
 
 import argparse
@@ -9,8 +9,10 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets as token_source
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -19,6 +21,8 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'src'))
+from tab_relay import Relay
 
 
 def default_home():
@@ -229,8 +233,16 @@ def mac_geometry(win):
     return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
 
 
-def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None, cbr=False):
-    if backend=='windows':
+AUDIO_FD = '@AUDIO_FD@'   # replaced by the worker with the real pipe descriptor
+
+
+def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None, cbr=False, audio=False, tab=False):
+    if tab:
+        # WebM from the browser's MediaRecorder (one shared tab), uploaded through the relay to stdin.
+        source = ['-fflags','+genpts','-analyzeduration','1000000','-probesize','2000000','-thread_queue_size','512',
+                  '-f','matroska','-i','pipe:0']
+        crop,encoder = '','h264_nvenc' if backend=='windows' else 'h264_videotoolbox'
+    elif backend=='windows':
         source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
         crop,encoder = '','h264_nvenc'
     elif window_size:
@@ -249,9 +261,15 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
     w,h = size
     matrix = ':out_color_matrix=bt709:out_range=tv' if window_size else ''
     vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease{matrix},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
-    command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,
-               '-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100',
-               '-map','0:v:0','-map','1:a:0','-vf',vf,'-c:v',encoder,'-b:v',bitrate,
+    if audio=='tab':
+        sound,audio_map = [],'0:a:0'   # the shared tab's own sound travels in the same WebM
+    elif audio:
+        # Raw float32 stereo from window-capture on an inherited pipe (the worker fills in the descriptor).
+        sound,audio_map = ['-f','f32le','-ar','48000','-ac','2','-i','pipe:'+AUDIO_FD],'1:a:0'
+    else:
+        sound,audio_map = ['-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100'],'1:a:0'
+    command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,*sound,
+               '-map','0:v:0','-map',audio_map,*(['-af','aresample=async=1:first_pts=0']if audio=='tab'else[]),'-vf',vf,'-c:v',encoder,'-b:v',bitrate,
                '-maxrate',bitrate,'-bufsize',str(2*int(bitrate[:-1]))+bitrate[-1],
                '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
                '-progress','pipe:1','-stats_period','1','-nostats']
@@ -321,7 +339,12 @@ def stop_owned(run):
 def inspect_plan(args, publish=True):
     backend = backend_name(args.backend)
     picking = bool(getattr(args,'pick',False))
-    if picking:
+    tabbing = getattr(args,'capture','window')=='tab'
+    if tabbing:
+        if picking or getattr(args,'window',None) or getattr(args,'guard',None):
+            raise ValueError('--capture tab shares a browser tab chosen in the browser; do not combine it with --pick, --window or --guard')
+        win = None
+    elif picking:
         if backend!='macos' or getattr(args,'capture','window')!='window':
             raise ValueError('--pick needs macOS window capture (--capture window)')
         win = None
@@ -339,10 +362,12 @@ def inspect_plan(args, publish=True):
     size,rate = common_settings(targets,args)
     if picking:
         win = {'id':0,'owner':'macOS sharing picker','name':'chosen by you in the picker','x':0,'y':0,'w':size[0],'h':size[1]}
+    if tabbing:
+        win = {'id':0,'owner':'browser','name':'tab chosen by you in the browser','x':0,'y':0,'w':size[0],'h':size[1]}
     window_capture = backend=='macos' and getattr(args,'capture','window')=='window'
-    crop = mac_geometry(win) if backend=='macos' and not window_capture else None
+    crop = mac_geometry(win) if backend=='macos' and not window_capture and not tabbing else None
     window_size = fit_size(win,size) if window_capture else None
-    if backend=='macos':
+    if backend=='macos' and not tabbing:
         access = json.loads(subprocess.check_output([str(helper()),'permissions'],text=True,timeout=10))
         if not access.get('screen_recording') and not args.dry_run:
             raise ValueError('Screen Recording permission is not granted on this Mac; allow the capture process in System Settings > Privacy & Security > Screen & System Audio Recording')
@@ -353,22 +378,32 @@ def inspect_plan(args, publish=True):
     hours = float(getattr(args,'max_hours',0) or 0)
     if not 0<=hours<=48:
         raise ValueError('--max-hours must be between 0 (no limit) and 48')
-    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size,cbr)
+    guard = (getattr(args,'guard',None) or '').strip()
+    if guard and not picking:
+        raise ValueError('--guard needs --pick; --window already requires the title text')
+    audio = ('tab' if tabbing else True) if bool(getattr(args,'audio',True)) and (window_capture or tabbing) else False
+    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size,cbr,audio,tabbing)
     # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
     capture_command = [str(capture_tool()),'--pick' if picking else '--match',*([] if picking else [args.window]),'--width',str(window_size[0]),
                        '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
     if capture_command and getattr(args,'window_id',None) and not picking:
         capture_command += ['--window-id',str(args.window_id)]
+    if capture_command and audio==True:
+        capture_command += ['--audio-fd',AUDIO_FD]
+    if capture_command and guard:
+        capture_command += ['--guard',guard]
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
-            'audio':'Silent stereo; game/microphone capture is not enabled',
+            'audio':'Audio of the shared tab only (its own sound; nothing from other tabs)' if audio=='tab' else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others); black and silent while the --guard title is missing' if audio and guard else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others)' if audio else 'Silent stereo; audio capture is off',
+            'guard':guard or None,
             'one_encode':True,'command':[redact(a,secrets)for a in command],
-            'capture':('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
+            'capture':'browser tab (chosen in the browser; only that tab\'s picture and sound)' if tabbing else ('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
             'capture_command':capture_command,
+            'tab_url':'http://127.0.0.1:%s/%s/'%(args.tab_port,args.tab_token) if tabbing and getattr(args,'tab_port',None) else None,
             'cbr_padding':cbr,'auto_stop_hours':hours if publish else 0,
             'observed_capture_fps':None,'platform_receipt':'unknown'}
-    if backend=='macos':
+    if backend=='macos' and not tabbing:
         plan['screen_recording_permission'] = access.get('screen_recording',False)
     if output:
         plan['preview_file'] = str(output[0])
@@ -410,20 +445,58 @@ def worker(args):
     progressfile = HOME/'logs'/(args.run_id+'-progress.json')
     creation = {'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
     capture = None
-    if plan.get('capture_command'):
+    relay = None
+    if plan.get('tab_url'):
+        # Browser tab sharing: the encoder starts when the first chunk arrives from the page.
+        holder,ready = {},threading.Event()
+        def start_encoder(_has_audio):
+            holder['process'] = subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                                 text=True,encoding='utf-8',errors='replace',**creation)
+            ready.set()
+            return holder['process'].stdin.buffer
+        relay = Relay(args.tab_token,start_encoder,args.tab_port,want_audio=bool(getattr(args,'audio',True)))
+        relay.serve()
+        write_json(HOME/'logs'/(args.run_id+'-tab.json'),{'url':relay.url()})
+        if os.name!='nt':
+            def stop_waiting(_signal,_frame):
+                relay.close()
+                raise SystemExit(0)
+            signal.signal(signal.SIGTERM,stop_waiting)
+        if not ready.wait(600 if args.mode=='preview' else 3600):
+            relay.close()
+            with logfile.open('a',encoding='utf-8')as log:
+                log.write('no browser tab was shared within the waiting time; giving up\n')
+            return 4
+    audio_pipe = os.pipe() if os.name!='nt' and AUDIO_FD in (plan.get('capture_command') or []) else None
+    if relay:
+        pass
+    elif plan.get('capture_command'):
+        capture_command = plan['capture_command']
+        if audio_pipe:
+            capture_command = [a.replace(AUDIO_FD,str(audio_pipe[1]))for a in capture_command]
+            command = [a.replace(AUDIO_FD,str(audio_pipe[0]))for a in command]
         with logfile.open('a',encoding='utf-8')as log:
-            capture = subprocess.Popen(plan['capture_command'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=log,**creation)
-    process = subprocess.Popen(command,stdin=capture.stdout if capture else subprocess.DEVNULL,stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',**creation)
+            capture = subprocess.Popen(capture_command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=log,
+                                       pass_fds=(audio_pipe[1],) if audio_pipe else (),**creation)
+    process = holder['process'] if relay else subprocess.Popen(command,stdin=capture.stdout if capture else subprocess.DEVNULL,stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',
+                               pass_fds=(audio_pipe[0],) if audio_pipe else (),**creation)
+    if audio_pipe:
+        os.close(audio_pipe[0])
+        os.close(audio_pipe[1])
     if capture:
         capture.stdout.close()
     if os.name!='nt':
         def terminate_worker(_signal,_frame):
+            if relay:
+                relay.close()
             raise SystemExit(0)
         signal.signal(signal.SIGTERM,terminate_worker)
     # Output duration alone cannot bound a capture device stuck before its first frame.
     def stop_stalled_preview():
         terminate_process(process)
+        if relay:
+            relay.close()
         if capture:
             terminate_process(capture)
     timer = threading.Timer(args.seconds+20+(60 if getattr(args,'pick',False) else 0),stop_stalled_preview) if preview else None
@@ -443,6 +516,8 @@ def worker(args):
         with logfile.open('a',encoding='utf-8')as log:
             log.write('auto-stop: reached --max-hours; ending the broadcast\n')
         terminate_process(process)
+        if relay:
+            relay.close()
         if capture:
             terminate_process(capture)
     stopper = start_auto_stop(float(getattr(args,'max_hours',0) or 0) if args.mode=='up' else 0,auto_stop)
@@ -466,6 +541,8 @@ def worker(args):
         if stopper:
             stopper.cancel()
         terminate_process(process)
+        if relay:
+            relay.close()
         if capture:
             terminate_process(capture)
 
@@ -476,6 +553,11 @@ def launch(args):
     if any(owned(run)for run in state['runs']):
         raise ValueError('An ano-stream process is already running; use status or down first')
     args.run_id = str(int(time.time()))+'-'+uuid.uuid4().hex[:8]
+    if getattr(args,'capture','window')=='tab':
+        with socket.socket()as probe:
+            probe.bind(('127.0.0.1',0))
+            args.tab_port = probe.getsockname()[1]
+        args.tab_token = token_source.token_urlsafe(18)
     plan,_,_ = inspect_plan(args,publish=args.mode=='up')
     if args.dry_run:
         return plan
@@ -497,7 +579,11 @@ def launch(args):
     time.sleep(.5)
     if process.poll() is not None:
         raise ValueError('Worker exited during startup; inspect '+run['worker_log'])
-    return {'worker_started':True,'run':run,'platform_receipt':'unknown; not proof of live broadcast'}
+    result = {'worker_started':True,'run':run,'platform_receipt':'unknown; not proof of live broadcast'}
+    if plan.get('tab_url'):
+        result['tab_url'] = plan['tab_url']
+        result['next_step'] = 'Open tab_url in the browser profile that holds the game (a private window needs it opened there), press the button and choose the game tab. Nothing is sent until you do.'
+    return result
 
 
 def status():
@@ -524,11 +610,13 @@ def main():
         item = sub.add_parser(name)
         item.add_argument('--window',help='Window text to match (app name and title); or use --pick')
         item.add_argument('--pick',action='store_true',help='macOS: choose any window or screen in the system sharing picker (like Meet)')
+        item.add_argument('--guard',help='With --pick: the shared window title must contain this text (for example your game page); another tab shows black and silence instead')
+        item.add_argument('--no-audio',dest='audio',action='store_false',help='send silence instead of the shared app or tab audio')
         item.add_argument('--window-id',type=int,help='Pin one window id (from devices); the window must also match --window. Use when several windows of one app share a title.')
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')
-        item.add_argument('--capture',choices=['window','screen-crop'],default='window',
-                          help='macOS: window = ScreenCaptureKit single-window capture (default); screen-crop = legacy whole-display grab cropped to the window')
+        item.add_argument('--capture',choices=['window','screen-crop','tab'],default='window',
+                          help='window = macOS ScreenCaptureKit single-window capture (default); tab = share one browser tab like Google Meet (picture and sound of only that tab); screen-crop = legacy whole-display grab cropped to the window')
         item.add_argument('--fps',type=int,choices=range(1,61),default=60,metavar='1..60')
         item.add_argument('--resolution')
         item.add_argument('--bitrate')

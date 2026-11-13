@@ -2,7 +2,7 @@
 //
 //   window-capture --match TEXT --width W --height H [--fps 60] [--frames N]
 //   window-capture --window-id ID --width W --height H [--fps 60] [--frames N]
-//   window-capture --pick --width W --height H [--fps 60]
+//   window-capture --pick --width W --height H [--fps 60] [--guard TEXT]
 //   window-capture --check
 //
 // Writes raw BGRA frames (W*H*4 bytes each, no header) to stdout at a constant
@@ -19,6 +19,16 @@
 // window or screen. Nothing is sent until you choose, and you can change the shared
 // window later from the sharing control in the menu bar. Cancelling or stopping sharing
 // ends the capture.
+//
+// --audio-fd N also captures the shared app's audio and writes it to file descriptor N as
+// raw interleaved float32 little-endian, 48 kHz stereo, at a constant rate (silence when
+// there is none). ScreenCaptureKit exposes audio per application, not per tab or window, so
+// every tab of the shared browser that is playing sound is included; mute the others.
+//
+// --guard TEXT (with --pick) keeps the shared window honest: whenever its title does not
+// contain TEXT (for example a different tab was opened in it) the picture goes black and the
+// audio goes silent until the title matches again. The check runs four times a second, so a
+// tab switch can show for a fraction of a second before the black frames start.
 //
 // --window-id pins one window id for its whole life (no re-resolve). With both
 // --window-id and --match, the window must have that id AND a matching title.
@@ -49,6 +59,8 @@ var fps = 60
 var maxFrames = -1
 var checkOnly = false
 var pick = false
+var audioFd: Int32 = -1
+var guardText = ""
 
 var it = CommandLine.arguments.dropFirst().makeIterator()
 while let a = it.next() {
@@ -61,6 +73,8 @@ while let a = it.next() {
     case "--frames": maxFrames = Int(it.next() ?? "") ?? -1
     case "--check": checkOnly = true
     case "--pick": pick = true
+    case "--audio-fd": audioFd = Int32(it.next() ?? "") ?? -1
+    case "--guard": guardText = (it.next() ?? "").lowercased()
     default: fail(2, "usage: window-capture (--match TEXT | --window-id ID) --width W --height H [--fps N] [--frames N] | --check")
     }
 }
@@ -73,6 +87,7 @@ if checkOnly { print("{\"screen_recording\":true}"); exit(0) }
 guard windowID > 0 || !match.isEmpty || pick, width >= 16, height >= 16, width % 2 == 0, height % 2 == 0, (1...60).contains(fps) else {
     fail(2, "need --match, --window-id or --pick, even --width/--height >= 16, and --fps 1..60")
 }
+if !guardText.isEmpty && !pick { fail(2, "--guard needs --pick (--match already requires the title text)") }
 
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let lock = NSLock()
@@ -87,7 +102,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     let writeQueue = DispatchQueue(label: "ano.window-capture.write")
     var timer: DispatchSourceTimer?
 
+    // Audio: interleaved stereo float32 at 48 kHz, queued from ScreenCaptureKit and paid out at
+    // exactly wall-clock rate so the encoder always sees a continuous track.
+    let audioRate = 48000
+    var audioQueue = [Float]()
+    var audioFile: UnsafeMutablePointer<FILE>?
+    var audioStartedAt: Date?
+    var audioWritten = 0
+    let audioWriteQueue = DispatchQueue(label: "ano.window-capture.audio-write")
+    var audioTimer: DispatchSourceTimer?
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio { takeAudio(sb); return }
         guard type == .screen, sb.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = attachments.first?[.status] as? Int,
@@ -102,7 +128,91 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func seed(_ pixels: CVPixelBuffer) {
-        lock.lock(); latest = pixels; lastFrameAt = Date(); warnedIdle = false; lock.unlock()
+        lock.lock()
+        // While blanked, nothing from the (wrong) window may become the next frame sent.
+        if !blank { latest = pixels }
+        lastFrameAt = Date(); warnedIdle = false
+        lock.unlock()
+    }
+
+    func isBlank() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return blank
+    }
+
+    func takeAudio(_ sb: CMSampleBuffer) {
+        guard audioFd >= 0, sb.isValid, CMSampleBufferGetNumSamples(sb) > 0,
+              let format = CMSampleBufferGetFormatDescription(sb),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0, asbd.mBitsPerChannel == 32 else { return }
+        let frames = CMSampleBufferGetNumSamples(sb)
+        let channels = max(Int(asbd.mChannelsPerFrame), 1)
+        let planar = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        var samples = [Float](repeating: 0, count: frames * 2)
+        do {
+            try sb.withAudioBufferList { list, _ in
+                for (index, buffer) in list.enumerated() {
+                    guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                    if planar {
+                        let available = min(frames, Int(buffer.mDataByteSize) / 4)
+                        for i in 0..<available {
+                            if list.count == 1 { samples[i * 2] = data[i]; samples[i * 2 + 1] = data[i] }
+                            else if index < 2 { samples[i * 2 + index] = data[i] }
+                        }
+                    } else {
+                        let available = min(frames, Int(buffer.mDataByteSize) / (4 * channels))
+                        for i in 0..<available {
+                            samples[i * 2] = data[i * channels]
+                            samples[i * 2 + 1] = data[i * channels + (channels > 1 ? 1 : 0)]
+                        }
+                    }
+                }
+            }
+        } catch { return }
+        lock.lock()
+        if !blank { audioQueue.append(contentsOf: samples) }
+        // Never let the queue fall more than a second behind real time.
+        if audioQueue.count > audioRate * 2 { audioQueue.removeFirst(audioQueue.count - audioRate * 2 / 5) }
+        lock.unlock()
+    }
+
+    /// Start the audio clock when capture first begins, so audio and video start together.
+    func startAudioClock() {
+        lock.lock(); defer { lock.unlock() }
+        if audioStartedAt == nil { audioStartedAt = Date() }
+    }
+
+    func emitAudio() {
+        guard let file = audioFile else { return }
+        lock.lock()
+        guard let start = audioStartedAt else { lock.unlock(); return }
+        let due = Int(Date().timeIntervalSince(start) * Double(audioRate)) - audioWritten
+        if due <= 0 { lock.unlock(); return }
+        var out = [Float](repeating: 0, count: due * 2)
+        if blank {
+            audioQueue.removeAll()
+        } else {
+            let n = min(out.count, audioQueue.count)
+            for i in 0..<n { out[i] = audioQueue[i] }
+            audioQueue.removeFirst(n)
+        }
+        audioWritten += due
+        lock.unlock()
+        let wrote = out.withUnsafeBytes { fwrite($0.baseAddress, 1, $0.count, file) }
+        if wrote != out.count * 4 || fflush(file) != 0 { exit(6) }
+    }
+
+    func startAudioTimer() {
+        guard audioFd >= 0 else { return }
+        audioFile = fdopen(audioFd, "w")
+        guard audioFile != nil else { fail(2, "cannot write audio to file descriptor \(audioFd)") }
+        setvbuf(audioFile, nil, _IOFBF, 1 << 16)
+        let t = DispatchSource.makeTimerSource(queue: audioWriteQueue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(20), leeway: .milliseconds(2))
+        t.setEventHandler { [unowned self] in self.emitAudio() }
+        audioTimer = t
+        t.resume()
     }
 
     func setStopped(_ value: Bool) {
@@ -117,7 +227,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// While no matching window is capturable, send black frames and drop the last real frame
     /// so nothing stale (or from a window that stopped matching) is ever broadcast.
     func setBlank(_ value: Bool) {
-        lock.lock(); blank = value; if value { latest = nil }; lock.unlock()
+        lock.lock(); blank = value; if value { latest = nil; audioQueue.removeAll() }; lock.unlock()
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -221,7 +331,7 @@ let capture = Capture()
 struct Session {
     let window: SCWindow?
     let stream: SCStream
-    let filter: SCContentFilter
+    var filter: SCContentFilter
     let config: SCStreamConfiguration
 }
 
@@ -238,10 +348,17 @@ func begin(filter: SCContentFilter, window: SCWindow?, label: String) async thro
     config.showsCursor = false
     config.scalesToFit = true
     config.queueDepth = 5
-    config.capturesAudio = false
+    config.capturesAudio = audioFd >= 0
+    config.sampleRate = capture.audioRate
+    config.channelCount = 2
+    config.excludesCurrentProcessAudio = true
     let stream = SCStream(filter: filter, configuration: config, delegate: capture)
     try stream.addStreamOutput(capture, type: .screen, sampleHandlerQueue: DispatchQueue(label: "ano.window-capture.frames"))
+    if audioFd >= 0 {
+        try stream.addStreamOutput(capture, type: .audio, sampleHandlerQueue: DispatchQueue(label: "ano.window-capture.audio"))
+    }
     try await stream.startCapture()
+    capture.startAudioClock()
     capture.setStopped(false)
     capture.setBlank(false)
     log("capturing \(label) at \(width)x\(height)@\(fps)")
@@ -266,6 +383,7 @@ final class PickerObserver: NSObject, SCContentSharingPickerObserver {
             do {
                 if let s = session {
                     try await s.stream.updateContentFilter(filter)
+                    session?.filter = filter
                     log("now sharing \(describeFilter(filter))")
                 } else {
                     session = try await begin(filter: filter, window: nil, label: describeFilter(filter))
@@ -285,6 +403,7 @@ if pick {
     let observer = PickerObserver()
     NSApplication.shared.setActivationPolicy(.accessory)
     capture.startTimer()   // no frames are sent until something is chosen
+    capture.startAudioTimer()
     Task { @MainActor in
         var cfg = SCContentSharingPickerConfiguration()
         cfg.allowedPickerModes = [.singleWindow, .singleDisplay]
@@ -295,12 +414,29 @@ if pick {
         picker.isActive = true
         picker.present()
         log("waiting for you to choose a window or screen in the macOS sharing picker")
+        var guardFailing = false
         while true {
             if capture.isStopped() { fail(5, "capture stopped (sharing ended)") }
-            if let s = observer.session, capture.secondsSinceFrame() > 0.9, let shot = await screenshot(s.filter, s.config) {
+            if !guardText.isEmpty, let s = observer.session {
+                // The shared window must still show the expected page (its title carries the
+                // active tab); otherwise send black and silence instead of another tab.
+                let ids = s.filter.includedWindows.map { $0.windowID }
+                if ids.isEmpty { fail(2, "--guard needs a shared window, not a screen") }
+                let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                if let content {
+                    let ok = content.windows.contains { w in
+                        ids.contains(w.windowID) && (w.title ?? "").lowercased().contains(guardText)
+                    }
+                    if !ok && !guardFailing { log("shared window no longer shows \"\(guardText)\" (another tab?); sending black and silence") }
+                    if ok && guardFailing { log("shared window shows \"\(guardText)\" again; resuming") }
+                    guardFailing = !ok
+                    capture.setBlank(!ok)
+                }
+            }
+            if let s = observer.session, !capture.isBlank(), capture.secondsSinceFrame() > 0.9, let shot = await screenshot(s.filter, s.config) {
                 capture.seed(shot)
             }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
     NSApplication.shared.run()
@@ -310,6 +446,7 @@ Task {
     var session: Session?
     var lostSince: Date?
     capture.startTimer()
+    capture.startAudioTimer()
     while true {
         // Every second, confirm the captured window still matches. A window whose title no
         // longer matches (for example its tab was switched to another page) is dropped at once.

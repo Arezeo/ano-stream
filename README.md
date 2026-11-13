@@ -34,7 +34,7 @@ python3 bin/ano-stream up --window "Game window" --to youtube,twitch --resolutio
 python3 bin/ano-stream down
 ```
 
-Default output is 1920×1080/60 FPS; explicit options and existing destination settings override it. A dry-run discovers and selects a window but does not capture, encode or publish. Missing keys are reported without pretending the destinations are ready. `preview` needs no keys and has no network output. The current audio track is **silent stereo**, not game audio or microphone capture.
+Default output is 1920×1080/60 FPS; explicit options and existing destination settings override it. A dry-run discovers and selects a window but does not capture, encode or publish. Missing keys are reported without pretending the destinations are ready. `preview` needs no keys and has no network output. `--capture tab` shares one browser tab through a local page (picture and sound of only that tab, like Meet; see docs/WORKFLOW.md). On macOS window capture (the default) the audio track is the shared app's sound from ScreenCaptureKit (`--no-audio` for silence); Windows and `--capture screen-crop` send silent stereo. There is no microphone capture.
 
 Multiple destinations use FFmpeg's `tee` muxer with explicit mappings and one encoder. Each output consumes upload bandwidth. Destinations must agree on resolution and bitrate unless explicit common overrides are supplied. The default shared bitrate is 6 Mbps; platform recommendations and available upload bandwidth should guide an explicit override.
 
