@@ -99,7 +99,18 @@ Compare the same model/settings before and during broadcasting: inference median
 
 `down` verifies process identity before stopping its own process tree. It leaves the model runner and game state alone. Multiple simultaneous `up` invocations are not supported; start one command at a time.
 
-## Audio and tab guard (macOS)
+## Sharing one browser tab (recommended for the game)
+
+`--capture tab` works like sharing a tab in Google Meet. `ano-stream up --capture tab ...` starts a small relay on `127.0.0.1` and prints a one-time address (`tab_url`). Open that address in the browser profile that holds the game (a private window needs it opened in a private tab), press **Choose the tab to stream**, pick the game under **Chrome Tab** and tick **Also share tab audio**. The page records only that tab's picture and sound and uploads it to the relay, which feeds FFmpeg. Nothing is sent until you choose.
+
+- Opening other tabs, switching tabs or windows, or covering the game never changes the stream; only the shared tab is sent, with only its own sound.
+- Stopping the sharing in the browser, or closing the sharing page, ends the broadcast. `--max-hours` and `down` work as before.
+- The page refuses a window or screen choice and (unless `--no-audio`) a share without tab audio.
+- The address contains a random token and the relay accepts only `127.0.0.1`/`localhost` host names, so other sites cannot post into it.
+- It needs Chrome, Edge or Arc, and no Screen Recording permission. The browser re-encodes the tab to H.264 and FFmpeg encodes it again to the broadcast bitrate, so keep the sharing page's window open (it does not need to be visible).
+- The window picker modes below remain for sharing a window or a whole screen.
+
+## Audio and tab guard (macOS window capture)
 
 `window-capture` also records the shared app's audio through ScreenCaptureKit and hands it to FFmpeg over an inherited pipe (48 kHz stereo float, written at a constant rate, silence when nothing plays). Use `--no-audio` to send silence instead.
 

@@ -213,6 +213,69 @@ class StreamTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'--guard needs --pick'):
                     s.inspect_plan(args,publish=False)
 
+    def test_tab_command_reads_one_webm_with_its_own_audio(self):
+        cmd = s.make_command('ffmpeg','macos',{'id':0},[('a',{},'rtmp://localhost/a')],tab=True,audio='tab',cbr=True)
+        self.assertEqual(cmd[cmd.index('-i')-1],'matroska')
+        self.assertEqual(cmd[cmd.index('-i')+1],'pipe:0')
+        self.assertEqual(cmd[cmd.index('-map')+1],'0:v:0')
+        self.assertIn('0:a:0',cmd)
+        self.assertNotIn('anullsrc=channel_layout=stereo:sample_rate=44100',cmd)
+        self.assertIn('aresample=async=1:first_pts=0',cmd)
+        silent = s.make_command('ffmpeg','macos',{'id':0},[('a',{},'rtmp://localhost/a')],tab=True,audio=False)
+        self.assertIn('anullsrc=channel_layout=stereo:sample_rate=44100',silent)
+        self.assertIn('1:a:0',silent)
+
+    def test_tab_plan_needs_no_window_or_screen_permission_and_rejects_other_pickers(self):
+        args = argparse.Namespace(window=None,pick=False,backend='macos',capture='tab',window_id=None,to='youtube',guard=None,
+                                  fps=60,resolution='1920x1080',bitrate=None,dry_run=True,seconds=3,mode='preview',run_id='x',
+                                  audio=True,tab_port=4321,tab_token='tok')
+        with patch.object(s,'ffmpeg_path',return_value='ffmpeg'),patch.object(s.subprocess,'check_output',side_effect=AssertionError('no helper needed')):
+            plan,cmd,_ = s.inspect_plan(args,publish=False)
+            self.assertEqual(plan['tab_url'],'http://127.0.0.1:4321/tok/')
+            self.assertIsNone(plan['capture_command'])
+            self.assertIn('0:a:0',cmd)
+            self.assertIn('Audio of the shared tab only',plan['audio'])
+            args.pick = True
+            with self.assertRaisesRegex(ValueError,'--capture tab'):
+                s.inspect_plan(args,publish=False)
+
+    def test_relay_accepts_ordered_chunks_from_the_local_page_only(self):
+        import http.client
+        sys.path.insert(0,str(ROOT/'src'))
+        from tab_relay import Relay
+        class Sink:
+            def __init__(self): self.data,self.closed = b'',False
+            def write(self,b): self.data += b
+            def flush(self): pass
+            def close(self): self.closed = True
+        sink,started = Sink(),[]
+        relay = Relay('tok',lambda audio:(started.append(audio),sink)[1],0,want_audio=True)
+        relay.serve()
+        self.addCleanup(relay.close)
+        def call(method,path,body=b'',headers=None,host=None):
+            conn = http.client.HTTPConnection('127.0.0.1',relay.port,timeout=5)
+            h = {'Host':host or '127.0.0.1:%d'%relay.port,**(headers or {})}
+            conn.request(method,path,body=body,headers=h)
+            response = conn.getresponse()
+            data = response.read()
+            conn.close()
+            return response.status,data
+        self.assertEqual(call('GET','/tok/')[0],200)
+        self.assertIn(b'getDisplayMedia',call('GET','/tok/')[1])
+        self.assertEqual(call('GET','/wrong/')[0],404)
+        self.assertEqual(call('GET','/tok/',host='evil.example:%d'%relay.port)[0],404)
+        self.assertEqual(call('POST','/tok/chunk',b'x',{'X-Seq':'0','X-Has-Audio':'1','Origin':'http://evil.example'})[0],404)
+        self.assertEqual(call('POST','/tok/chunk',b'x',{'X-Seq':'0','X-Has-Audio':'0'})[0],400)   # audio required
+        self.assertEqual(call('POST','/tok/chunk',b'AA',{'X-Seq':'0','X-Has-Audio':'1'})[0],200)
+        self.assertEqual(call('POST','/tok/chunk',b'CC',{'X-Seq':'2','X-Has-Audio':'1'})[0],409)   # gap
+        self.assertEqual(call('POST','/tok/chunk',b'AA',{'X-Seq':'0','X-Has-Audio':'1'})[0],200)   # retry, not written twice
+        self.assertEqual(call('POST','/tok/chunk',b'BB',{'X-Seq':'1','X-Has-Audio':'1'})[0],200)
+        self.assertEqual(sink.data,b'AABB')
+        self.assertEqual(started,[True])
+        self.assertEqual(call('POST','/tok/end')[0],200)
+        self.assertTrue(sink.closed)
+        self.assertEqual(call('POST','/tok/chunk',b'DD',{'X-Seq':'2','X-Has-Audio':'1'})[0],410)
+
     def test_auto_stop_fires_after_the_limit_and_zero_means_no_limit(self):
         self.assertIsNone(s.start_auto_stop(0,lambda:None))
         fired = threading.Event()
