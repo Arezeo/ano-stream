@@ -229,7 +229,7 @@ def mac_geometry(win):
     return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
 
 
-def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None):
+def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None, cbr=False):
     if backend=='windows':
         source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
         crop,encoder = '','h264_nvenc'
@@ -244,6 +244,8 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
             raise ValueError('macOS capture requires verified display geometry')
         x,y,w,h = mac_crop
         crop,encoder = f'crop={w}:{h}:{x}:{y},','h264_videotoolbox'
+    if cbr and backend=='macos':
+        encoder = 'libx264'   # VideoToolbox spends almost nothing on a still picture and cannot pad
     w,h = size
     matrix = ':out_color_matrix=bt709:out_range=tv' if window_size else ''
     vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease{matrix},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
@@ -253,7 +255,16 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
                '-maxrate',bitrate,'-bufsize',str(2*int(bitrate[:-1]))+bitrate[-1],
                '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
                '-progress','pipe:1','-stats_period','1','-nostats']
-    command += ['-preset','p4','-rc','cbr'] if backend=='windows' else ['-realtime','1','-allow_sw','0']
+    if backend=='windows':
+        command += ['-preset','p4','-rc','cbr']
+    elif cbr:
+        # True constant bitrate: x264 pads with filler so a still page still sends the full rate
+        # (YouTube recommends CBR and a 2 s keyframe interval). Uses the CPU.
+        g = fps*2
+        command += ['-preset','veryfast','-profile:v','high','-minrate',bitrate,
+                    '-x264-params',f'nal-hrd=cbr:force-cfr=1:keyint={g}:min-keyint={g}:scenecut=0']
+    else:
+        command += ['-realtime','1','-allow_sw','0']
     if window_size:
         command += ['-colorspace','bt709','-color_primaries','bt709','-color_trc','bt709']
     if output:
@@ -336,7 +347,13 @@ def inspect_plan(args, publish=True):
         if not access.get('screen_recording') and not args.dry_run:
             raise ValueError('Screen Recording permission is not granted on this Mac; allow the capture process in System Settings > Privacy & Security > Screen & System Audio Recording')
     output = (HOME/'previews'/(args.run_id+'.mkv'),args.seconds) if not publish else None
-    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size)
+    cbr = bool(getattr(args,'cbr',False))
+    if cbr and backend!='macos':
+        raise ValueError('--cbr is only for macOS; NVENC on Windows already uses constant bitrate')
+    hours = float(getattr(args,'max_hours',0) or 0)
+    if not 0<=hours<=48:
+        raise ValueError('--max-hours must be between 0 (no limit) and 48')
+    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size,cbr)
     # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
     capture_command = [str(capture_tool()),'--pick' if picking else '--match',*([] if picking else [args.window]),'--width',str(window_size[0]),
                        '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
@@ -349,12 +366,23 @@ def inspect_plan(args, publish=True):
             'one_encode':True,'command':[redact(a,secrets)for a in command],
             'capture':('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
             'capture_command':capture_command,
+            'cbr_padding':cbr,'auto_stop_hours':hours if publish else 0,
             'observed_capture_fps':None,'platform_receipt':'unknown'}
     if backend=='macos':
         plan['screen_recording_permission'] = access.get('screen_recording',False)
     if output:
         plan['preview_file'] = str(output[0])
     return plan,command,secrets
+
+
+def start_auto_stop(hours, action):
+    """Run action() after `hours`; returns the started daemon Timer, or None when there is no limit."""
+    if not hours:
+        return None
+    timer = threading.Timer(hours*3600,action)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def terminate_process(process, grace=3):
@@ -409,6 +437,15 @@ def worker(args):
                 log.flush()
     thread = threading.Thread(target=errors,daemon=True)
     thread.start()
+    ended = {}
+    def auto_stop():
+        ended['by'] = 'max-hours'
+        with logfile.open('a',encoding='utf-8')as log:
+            log.write('auto-stop: reached --max-hours; ending the broadcast\n')
+        terminate_process(process)
+        if capture:
+            terminate_process(capture)
+    stopper = start_auto_stop(float(getattr(args,'max_hours',0) or 0) if args.mode=='up' else 0,auto_stop)
     try:
         frame = {}
         for line in process.stdout:
@@ -421,11 +458,13 @@ def worker(args):
         thread.join(timeout=2)
         if capture:
             terminate_process(capture)
-        write_json(HOME/'logs'/(args.run_id+'-exit.json'),{'at':time.time(),'code':code,'capture_code':capture.returncode if capture else None,'platform_receipt':'unknown','preview_file':preview})
+        write_json(HOME/'logs'/(args.run_id+'-exit.json'),{'at':time.time(),'code':code,'capture_code':capture.returncode if capture else None,'ended_by':ended.get('by'),'platform_receipt':'unknown','preview_file':preview})
         return code
     finally:
         if timer:
             timer.cancel()
+        if stopper:
+            stopper.cancel()
         terminate_process(process)
         if capture:
             terminate_process(capture)
@@ -493,6 +532,8 @@ def main():
         item.add_argument('--fps',type=int,choices=range(1,61),default=60,metavar='1..60')
         item.add_argument('--resolution')
         item.add_argument('--bitrate')
+        item.add_argument('--cbr',action='store_true',help='macOS: true constant bitrate with x264 (CPU) so a still page still sends the full rate; VideoToolbox cannot pad')
+        item.add_argument('--max-hours',type=float,default=3.0,help='Auto-stop a live broadcast after this many hours (default 3; 0 = no limit)')
         item.add_argument('--dry-run',action='store_true')
         item.add_argument('--live',action='store_true',help='Publish to the selected destinations (up only)')
         item.add_argument('--seconds',type=int,choices=range(1,61),default=3,metavar='1..60')

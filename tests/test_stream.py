@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import threading
 import subprocess
 import sys
 import time
@@ -169,6 +170,41 @@ class StreamTests(unittest.TestCase):
         args.capture,args.pick,args.window = 'window',False,None
         with self.assertRaisesRegex(ValueError,'--window TEXT'):
             s.inspect_plan(args,publish=False)
+    def test_cbr_on_macos_uses_x264_padding_not_videotoolbox(self):
+        cmd = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],bitrate='17000k',window_size=(1920,1080),cbr=True)
+        self.assertEqual(cmd[cmd.index('-c:v')+1],'libx264')
+        self.assertNotIn('h264_videotoolbox',cmd)
+        self.assertNotIn('-allow_sw',cmd)
+        self.assertEqual(cmd[cmd.index('-minrate')+1],'17000k')
+        self.assertEqual(cmd[cmd.index('-maxrate')+1],'17000k')
+        self.assertIn('nal-hrd=cbr',cmd[cmd.index('-x264-params')+1])
+        self.assertIn('keyint=120',cmd[cmd.index('-x264-params')+1])
+        plain = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],window_size=(1920,1080))
+        self.assertIn('h264_videotoolbox',plain)
+        self.assertNotIn('-x264-params',plain)
+
+    def test_auto_stop_fires_after_the_limit_and_zero_means_no_limit(self):
+        self.assertIsNone(s.start_auto_stop(0,lambda:None))
+        fired = threading.Event()
+        timer = s.start_auto_stop(0.00002,fired.set)   # ~0.07 s
+        self.addCleanup(timer.cancel)
+        self.assertTrue(fired.wait(3))
+
+    def test_max_hours_and_cbr_are_validated(self):
+        args = argparse.Namespace(window='Game',pick=False,backend='macos',capture='window',window_id=None,to='youtube',fps=60,
+                                  resolution='1920x1080',bitrate=None,dry_run=True,seconds=3,mode='up',run_id='x',max_hours=99,cbr=False)
+        with patch.object(s,'windows',return_value=[{'id':1,'owner':'App','name':'Game','x':0,'y':0,'w':1000,'h':800}]),\
+             patch.object(s,'ffmpeg_path',return_value='ffmpeg'),patch.object(s,'capture_tool',return_value=Path('/x/wc')),\
+             patch.object(s,'helper',return_value=Path('/x/h')),patch.object(s.subprocess,'check_output',return_value='{"screen_recording": true}'):
+            with self.assertRaisesRegex(ValueError,'--max-hours'):
+                s.inspect_plan(args)
+            args.max_hours = 3
+            plan,cmd,_ = s.inspect_plan(args)
+            self.assertEqual(plan['auto_stop_hours'],3.0)
+            args.backend,args.cbr = 'windows',True
+            with self.assertRaisesRegex(ValueError,'--cbr is only for macOS'):
+                s.inspect_plan(args)
+
 
 if __name__=='__main__':
     unittest.main()
