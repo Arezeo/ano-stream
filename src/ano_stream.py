@@ -229,7 +229,10 @@ def mac_geometry(win):
     return [int((win['x']-main['x'])*sx),int((win['y']-main['y'])*sy),int(win['w']*sx)//2*2,int(win['h']*sy)//2*2]
 
 
-def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None, cbr=False):
+AUDIO_FD = '@AUDIO_FD@'   # replaced by the worker with the real pipe descriptor
+
+
+def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bitrate='6000k', output=None, mac_crop=None, window_size=None, cbr=False, audio=False):
     if backend=='windows':
         source = ['-f','gdigrab','-draw_mouse','0','-framerate',str(fps),'-i','hwnd='+str(win['id'])]
         crop,encoder = '','h264_nvenc'
@@ -249,8 +252,12 @@ def make_command(executable, backend, win, targets, fps=60, size=(1920,1080), bi
     w,h = size
     matrix = ':out_color_matrix=bt709:out_range=tv' if window_size else ''
     vf = crop+f'scale={w}:{h}:force_original_aspect_ratio=decrease{matrix},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p'
-    command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,
-               '-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100',
+    if audio:
+        # Raw float32 stereo from window-capture on an inherited pipe (the worker fills in the descriptor).
+        sound = ['-f','f32le','-ar','48000','-ac','2','-i','pipe:'+AUDIO_FD]
+    else:
+        sound = ['-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100']
+    command = [executable,'-hide_banner','-loglevel','warning','-nostdin','-y',*source,*sound,
                '-map','0:v:0','-map','1:a:0','-vf',vf,'-c:v',encoder,'-b:v',bitrate,
                '-maxrate',bitrate,'-bufsize',str(2*int(bitrate[:-1]))+bitrate[-1],
                '-g',str(fps*2),'-c:a','aac','-b:a','128k','-ar','44100',
@@ -353,16 +360,25 @@ def inspect_plan(args, publish=True):
     hours = float(getattr(args,'max_hours',0) or 0)
     if not 0<=hours<=48:
         raise ValueError('--max-hours must be between 0 (no limit) and 48')
-    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size,cbr)
+    guard = (getattr(args,'guard',None) or '').strip()
+    if guard and not picking:
+        raise ValueError('--guard needs --pick; --window already requires the title text')
+    audio = bool(getattr(args,'audio',True)) and window_capture
+    command = make_command(ffmpeg_path(),backend,win,targets,args.fps,size,rate,output,crop,window_size,cbr,audio)
     # The tool re-resolves the window by this text, so a recreated window (Arc does this) is found again.
     capture_command = [str(capture_tool()),'--pick' if picking else '--match',*([] if picking else [args.window]),'--width',str(window_size[0]),
                        '--height',str(window_size[1]),'--fps',str(args.fps)] if window_capture else None
     if capture_command and getattr(args,'window_id',None) and not picking:
         capture_command += ['--window-id',str(args.window_id)]
+    if capture_command and audio:
+        capture_command += ['--audio-fd',AUDIO_FD]
+    if capture_command and guard:
+        capture_command += ['--guard',guard]
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
-            'audio':'Silent stereo; game/microphone capture is not enabled',
+            'audio':'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others); black and silent while the --guard title is missing' if audio and guard else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others)' if audio else 'Silent stereo; audio capture is off',
+            'guard':guard or None,
             'one_encode':True,'command':[redact(a,secrets)for a in command],
             'capture':('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
             'capture_command':capture_command,
@@ -410,11 +426,21 @@ def worker(args):
     progressfile = HOME/'logs'/(args.run_id+'-progress.json')
     creation = {'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
     capture = None
+    audio_pipe = os.pipe() if os.name!='nt' and AUDIO_FD in (plan.get('capture_command') or []) else None
     if plan.get('capture_command'):
+        capture_command = plan['capture_command']
+        if audio_pipe:
+            capture_command = [a.replace(AUDIO_FD,str(audio_pipe[1]))for a in capture_command]
+            command = [a.replace(AUDIO_FD,str(audio_pipe[0]))for a in command]
         with logfile.open('a',encoding='utf-8')as log:
-            capture = subprocess.Popen(plan['capture_command'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=log,**creation)
+            capture = subprocess.Popen(capture_command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=log,
+                                       pass_fds=(audio_pipe[1],) if audio_pipe else (),**creation)
     process = subprocess.Popen(command,stdin=capture.stdout if capture else subprocess.DEVNULL,stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',**creation)
+                               stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',
+                               pass_fds=(audio_pipe[0],) if audio_pipe else (),**creation)
+    if audio_pipe:
+        os.close(audio_pipe[0])
+        os.close(audio_pipe[1])
     if capture:
         capture.stdout.close()
     if os.name!='nt':
@@ -524,6 +550,8 @@ def main():
         item = sub.add_parser(name)
         item.add_argument('--window',help='Window text to match (app name and title); or use --pick')
         item.add_argument('--pick',action='store_true',help='macOS: choose any window or screen in the system sharing picker (like Meet)')
+        item.add_argument('--guard',help='With --pick: the shared window title must contain this text (for example your game page); another tab shows black and silence instead')
+        item.add_argument('--no-audio',dest='audio',action='store_false',help='macOS window capture: send silence instead of the shared app\'s audio')
         item.add_argument('--window-id',type=int,help='Pin one window id (from devices); the window must also match --window. Use when several windows of one app share a title.')
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')

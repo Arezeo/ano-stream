@@ -183,6 +183,36 @@ class StreamTests(unittest.TestCase):
         self.assertIn('h264_videotoolbox',plain)
         self.assertNotIn('-x264-params',plain)
 
+    def test_window_audio_reads_a_pipe_instead_of_silence(self):
+        cmd = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],window_size=(1920,1080),audio=True)
+        self.assertNotIn('anullsrc=channel_layout=stereo:sample_rate=44100',cmd)
+        i = cmd.index('pipe:'+s.AUDIO_FD)
+        self.assertEqual(cmd[i-7:i],['-f','f32le','-ar','48000','-ac','2','-i'])
+        self.assertIn('1:a:0',cmd)
+        silent = s.make_command('ffmpeg','macos',{'id':9},[('a',{},'rtmp://localhost/a')],window_size=(1920,1080))
+        self.assertIn('anullsrc=channel_layout=stereo:sample_rate=44100',silent)
+
+    def test_guard_and_audio_reach_the_capture_tool_only_where_valid(self):
+        args = argparse.Namespace(window=None,pick=True,backend='macos',capture='window',window_id=None,to='youtube',guard='AGENT NUMBER ONE',
+                                  fps=60,resolution='1920x1080',bitrate=None,dry_run=True,seconds=3,mode='preview',run_id='x',audio=True)
+        with patch.object(s,'ffmpeg_path',return_value='ffmpeg'),patch.object(s,'capture_tool',return_value=Path('/x/window-capture')),\
+             patch.object(s,'helper',return_value=Path('/x/os-helper')),patch.object(s.subprocess,'check_output',return_value='{"screen_recording": true}'):
+            plan,cmd,_ = s.inspect_plan(args,publish=False)
+            capture = plan['capture_command']
+            self.assertEqual(capture[capture.index('--guard')+1],'AGENT NUMBER ONE')
+            self.assertEqual(capture[capture.index('--audio-fd')+1],s.AUDIO_FD)
+            self.assertIn('pipe:'+s.AUDIO_FD,cmd)
+            args.audio = False
+            plan,cmd,_ = s.inspect_plan(args,publish=False)
+            self.assertNotIn('--audio-fd',plan['capture_command'])
+            self.assertIn('anullsrc=channel_layout=stereo:sample_rate=44100',cmd)
+            self.assertIn('Silent',plan['audio'])
+            args.pick,args.window,args.guard = False,'Game',None
+            args.guard = 'x'
+            with patch.object(s,'windows',return_value=[{'id':1,'owner':'App','name':'Game','x':0,'y':0,'w':1000,'h':800}]):
+                with self.assertRaisesRegex(ValueError,'--guard needs --pick'):
+                    s.inspect_plan(args,publish=False)
+
     def test_auto_stop_fires_after_the_limit_and_zero_means_no_limit(self):
         self.assertIsNone(s.start_auto_stop(0,lambda:None))
         fired = threading.Event()
