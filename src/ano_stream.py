@@ -395,10 +395,10 @@ def inspect_plan(args, publish=True):
     plan = {'backend':backend,'host':platform.node(),'window':win,'resolution':size,'fps_target':args.fps,
             'bitrate':rate,'destinations':[name for name,_,_ in targets] if publish else [],
             'missing_keys':missing,'credential_ready':not missing,'dry_run':args.dry_run,
-            'audio':'Audio of the shared tab only (its own sound; nothing from other tabs)' if audio=='tab' else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others); black and silent while the --guard title is missing' if audio and guard else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others)' if audio else 'Silent stereo; audio capture is off',
+            'audio':'Audio of a shared tab only (its own sound, nothing from other tabs); a shared window or screen is silent in the browser' if audio=='tab' else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others); black and silent while the --guard title is missing' if audio and guard else 'Audio of the shared app (ScreenCaptureKit; every tab of that browser that plays sound, so mute the others)' if audio else 'Silent stereo; audio capture is off',
             'guard':guard or None,
             'one_encode':True,'command':[redact(a,secrets)for a in command],
-            'capture':'browser tab (chosen in the browser; only that tab\'s picture and sound)' if tabbing else ('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
+            'capture':'browser share (tab, window or entire screen, chosen in the browser picker like Meet; a tab sends only its own picture and sound)' if tabbing else ('window or screen (ScreenCaptureKit, chosen in the macOS sharing picker; nothing is sent until you choose)' if picking else 'window (ScreenCaptureKit, matches '+repr(args.window)+', re-resolved if recreated)') if window_capture else 'screen-crop (whole main display cropped to the window; shows anything overlapping it)' if backend=='macos' else 'window (gdigrab)',
             'capture_command':capture_command,
             'tab_url':'http://127.0.0.1:%s/%s/'%(args.tab_port,args.tab_token) if tabbing and getattr(args,'tab_port',None) else None,
             'cbr_padding':cbr,'auto_stop_hours':hours if publish else 0,
@@ -449,8 +449,10 @@ def worker(args):
     if plan.get('tab_url'):
         # Browser tab sharing: the encoder starts when the first chunk arrives from the page.
         holder,ready = {},threading.Event()
-        def start_encoder(_has_audio):
-            holder['process'] = subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+        silent_args = argparse.Namespace(**{**vars(args),'audio':False})
+        silent_command = inspect_plan(silent_args,publish=args.mode=='up')[1]
+        def start_encoder(has_audio):
+            holder['process'] = subprocess.Popen(command if has_audio else silent_command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                                  text=True,encoding='utf-8',errors='replace',**creation)
             ready.set()
             return holder['process'].stdin.buffer
@@ -608,15 +610,15 @@ def main():
     key.add_argument('destination')
     for name in ('up','preview'):
         item = sub.add_parser(name)
-        item.add_argument('--window',help='Window text to match (app name and title); or use --pick')
+        item.add_argument('--window',help='Window text to match (app name and title); selects window capture. Without --window or --pick the default is browser tab sharing')
         item.add_argument('--pick',action='store_true',help='macOS: choose any window or screen in the system sharing picker (like Meet)')
         item.add_argument('--guard',help='With --pick: the shared window title must contain this text (for example your game page); another tab shows black and silence instead')
         item.add_argument('--no-audio',dest='audio',action='store_false',help='send silence instead of the shared app or tab audio')
         item.add_argument('--window-id',type=int,help='Pin one window id (from devices); the window must also match --window. Use when several windows of one app share a title.')
         item.add_argument('--backend',choices=['auto','macos','windows'],default='auto')
         item.add_argument('--to',default='youtube')
-        item.add_argument('--capture',choices=['window','screen-crop','tab'],default='window',
-                          help='window = macOS ScreenCaptureKit single-window capture (default); tab = share one browser tab like Google Meet (picture and sound of only that tab); screen-crop = legacy whole-display grab cropped to the window')
+        item.add_argument('--capture',choices=['window','screen-crop','tab'],default=None,
+                          help='tab = share from the browser like Google Meet: a tab (its picture and sound only), a window or the entire screen (default); window = macOS ScreenCaptureKit single-window capture (default when --window or --pick is given); screen-crop = legacy whole-display grab cropped to the window')
         item.add_argument('--fps',type=int,choices=range(1,61),default=60,metavar='1..60')
         item.add_argument('--resolution')
         item.add_argument('--bitrate')
@@ -630,6 +632,8 @@ def main():
     internal = sub.add_parser('_worker',help=argparse.SUPPRESS)
     internal.add_argument('--run-id',required=True)
     args = parser.parse_args()
+    if args.mode in ('up','preview') and args.capture is None:
+        args.capture = 'window' if args.pick or args.window else 'tab'
     try:
         if args.mode=='init':
             init_home()

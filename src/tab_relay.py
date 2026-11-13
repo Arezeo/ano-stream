@@ -1,9 +1,9 @@
-"""Browser-tab sharing for ano-stream.
+"""Browser sharing for ano-stream, like Google Meet.
 
-A page served here asks the browser (Chrome, Edge, Arc) to share ONE tab, like the "Chrome tab"
-option in Google Meet, records only that tab's picture and sound, and uploads the chunks to this
-relay, which feeds them to FFmpeg. Other tabs and windows never enter the stream, whatever you
-open or switch to.
+A page served here opens the browser's own share picker (Chrome, Edge, Arc): a Chrome tab, a
+window or the entire screen. It records only what was chosen and uploads the chunks to this
+relay, which feeds them to FFmpeg. A shared tab sends only that tab's picture and sound, so other
+tabs and windows never enter the stream, whatever you open or switch to.
 """
 import json
 import threading
@@ -13,31 +13,31 @@ MAX_CHUNK = 32*1024*1024
 
 PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ANO tab stream</title>
+<title>ANO stream</title>
 <style>
  :root{color-scheme:dark light} body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}
  button{font:inherit;padding:.6rem 1rem;margin:.25rem .5rem .25rem 0;cursor:pointer}
  #state{padding:.75rem 1rem;border-radius:8px;background:#8883}
  .live{background:#1a7f3733!important} .bad{background:#c0392b33!important}
 </style></head><body>
-<h1>Stream one browser tab</h1>
-<p>Open the game in this same browser profile (for a private window, open this page in that private window too). Then press the button, choose the game tab under <b>Chrome Tab</b>, and tick <b>Also share tab audio</b>.</p>
+<h1>Choose what to stream</h1>
+<p>Press the button and pick in the browser, as in Meet: <b>Chrome Tab</b> (best: only that tab's picture and sound, tick <b>Also share tab audio</b>), <b>Window</b> or <b>Entire Screen</b> (picture only, no sound in this browser). To list a private-window tab, open this page in that private window.</p>
 <p id="state">Nothing is being streamed yet.</p>
-<button id="go">Choose the tab to stream</button><button id="stop" disabled>Stop streaming</button>
-<p><small>Only the chosen tab is sent: its picture and its sound. Closing this page, or choosing Stop sharing in the browser, ends the broadcast.</small></p>
+<button id="go">Choose what to stream</button><button id="stop" disabled>Stop streaming</button>
+<p><small>Only what you choose is sent. Closing this page, or choosing Stop sharing in the browser, ends the broadcast.</small></p>
 <script>
 const WANT_AUDIO = __WANT_AUDIO__;
 const base = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
 const $ = id => document.getElementById(id);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let recorder = null, stream = null, seq = 0, sent = 0, startedAt = 0, failed = false, finished = false;
+let recorder = null, stream = null, surface = 'unknown', seq = 0, sent = 0, startedAt = 0, failed = false, finished = false;
 function say(text, kind) { const s = $('state'); s.textContent = text; s.className = kind || ''; }
 
 async function post(n, blob) {
   for (let attempt = 0; attempt < 40 && !finished; attempt++) {
     try {
       const r = await fetch(base + 'chunk', { method: 'POST', body: blob,
-        headers: { 'X-Seq': String(n), 'X-Has-Audio': stream.getAudioTracks().length ? '1' : '0' } });
+        headers: { 'X-Seq': String(n), 'X-Has-Audio': stream.getAudioTracks().length ? '1' : '0', 'X-Surface': surface } });
       if (r.ok) { sent += blob.size; return true; }
       if (r.status === 410) return false;           // the encoder has ended
       if (r.status === 400) { failed = true; return false; }
@@ -60,18 +60,13 @@ function finish(message, kind) {
 $('go').onclick = async () => {
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { displaySurface: 'browser', width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60, max: 60 } },
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60, max: 60 } },
       audio: WANT_AUDIO ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false } : false,
-      preferCurrentTab: false, selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'exclude',
-      surfaceSwitching: 'exclude', systemAudio: 'exclude' });
+      preferCurrentTab: false, selfBrowserSurface: 'exclude', surfaceSwitching: 'exclude', systemAudio: 'include' });
   } catch (e) { say('Nothing was shared (' + e.name + '). Press the button to try again.', 'bad'); return; }
   const video = stream.getVideoTracks()[0];
-  const surface = video.getSettings().displaySurface;
-  if (surface && surface !== 'browser') {
-    stream.getTracks().forEach(t => t.stop());
-    say('That was a ' + surface + ', not a browser tab. Choose the game under "Chrome Tab".', 'bad'); return;
-  }
-  if (WANT_AUDIO && !stream.getAudioTracks().length) {
+  surface = video.getSettings().displaySurface || 'unknown';
+  if (WANT_AUDIO && surface === 'browser' && !stream.getAudioTracks().length) {
     stream.getTracks().forEach(t => t.stop());
     say('No tab audio was shared. Choose the tab again and tick "Also share tab audio".', 'bad'); return;
   }
@@ -89,7 +84,7 @@ $('go').onclick = async () => {
   recorder.start(250);
   startedAt = Date.now();
   $('go').disabled = true; $('stop').disabled = false;
-  const tick = () => { if (!finished) { say('Streaming this tab (' + (stream.getAudioTracks().length ? 'with' : 'without') + ' its sound) - ' +
+  const tick = () => { if (!finished) { say('Streaming ' + ({browser:'this tab',window:'this window',monitor:'the ENTIRE SCREEN'}[surface] || 'your share') + ' (' + (stream.getAudioTracks().length ? 'with' : 'without') + ' sound) - ' +
     Math.round((Date.now() - startedAt) / 1000) + ' s, ' + (sent / 1048576).toFixed(1) + ' MB sent', 'live'); setTimeout(tick, 1000); } };
   tick();
 };
@@ -169,7 +164,8 @@ class Relay:
                 except ValueError:
                     return self.reply(400)
                 has_audio = self.headers.get('X-Has-Audio') == '1'
-                self.reply(relay.accept(seq, has_audio, body))
+                surface = self.headers.get('X-Surface', 'unknown')
+                self.reply(relay.accept(seq, has_audio, body, surface))
 
         self.server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
         self.server.daemon_threads = True
@@ -181,7 +177,7 @@ class Relay:
     def url(self):
         return 'http://127.0.0.1:%d/%s/' % (self.port, self.token)
 
-    def accept(self, seq, has_audio, body):
+    def accept(self, seq, has_audio, body, surface='browser'):
         """Returns an HTTP status: 200 stored (or already stored), 409 out of order, 410 ended, 400 refused, 503 no encoder."""
         with self.lock:
             if self.ended.is_set():
@@ -191,8 +187,8 @@ class Relay:
             if seq != self.next_seq:
                 return 409
             if self.sink is None:
-                if self.want_audio and not has_audio:
-                    return 400
+                if self.want_audio and surface == 'browser' and not has_audio:
+                    return 400   # a tab share must carry its sound; window/screen shares cannot in this browser
                 self.sink = self.start(has_audio)
                 if self.sink is None:
                     return 503

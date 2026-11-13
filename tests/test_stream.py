@@ -234,7 +234,7 @@ class StreamTests(unittest.TestCase):
             self.assertEqual(plan['tab_url'],'http://127.0.0.1:4321/tok/')
             self.assertIsNone(plan['capture_command'])
             self.assertIn('0:a:0',cmd)
-            self.assertIn('Audio of the shared tab only',plan['audio'])
+            self.assertIn('Audio of a shared tab only',plan['audio'])
             args.pick = True
             with self.assertRaisesRegex(ValueError,'--capture tab'):
                 s.inspect_plan(args,publish=False)
@@ -265,7 +265,7 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(call('GET','/wrong/')[0],404)
         self.assertEqual(call('GET','/tok/',host='evil.example:%d'%relay.port)[0],404)
         self.assertEqual(call('POST','/tok/chunk',b'x',{'X-Seq':'0','X-Has-Audio':'1','Origin':'http://evil.example'})[0],404)
-        self.assertEqual(call('POST','/tok/chunk',b'x',{'X-Seq':'0','X-Has-Audio':'0'})[0],400)   # audio required
+        self.assertEqual(call('POST','/tok/chunk',b'x',{'X-Seq':'0','X-Has-Audio':'0','X-Surface':'browser'})[0],400)   # a tab must carry sound
         self.assertEqual(call('POST','/tok/chunk',b'AA',{'X-Seq':'0','X-Has-Audio':'1'})[0],200)
         self.assertEqual(call('POST','/tok/chunk',b'CC',{'X-Seq':'2','X-Has-Audio':'1'})[0],409)   # gap
         self.assertEqual(call('POST','/tok/chunk',b'AA',{'X-Seq':'0','X-Has-Audio':'1'})[0],200)   # retry, not written twice
@@ -275,6 +275,34 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(call('POST','/tok/end')[0],200)
         self.assertTrue(sink.closed)
         self.assertEqual(call('POST','/tok/chunk',b'DD',{'X-Seq':'2','X-Has-Audio':'1'})[0],410)
+
+    def test_capture_defaults_to_tab_sharing_unless_a_window_is_asked_for(self):
+        seen = []
+        def fake_launch(args):
+            seen.append(args.capture)
+            return {}
+        for argv,expected in [(['preview'],'tab'),(['preview','--window','Game'],'window'),(['preview','--pick'],'window'),
+                              (['preview','--capture','screen-crop','--window','Game'],'screen-crop')]:
+            with patch.object(s,'launch',fake_launch),patch.object(sys,'argv',['ano-stream']+argv),patch('builtins.print'):
+                s.main()
+            self.assertEqual(seen[-1],expected,argv)
+
+    def test_relay_allows_a_silent_window_or_screen_share_and_reports_it(self):
+        import http.client
+        sys.path.insert(0,str(ROOT/'src'))
+        from tab_relay import Relay
+        class Sink:
+            def write(self,b): pass
+            def flush(self): pass
+            def close(self): pass
+        started = []
+        relay = Relay('tok',lambda audio:(started.append(audio),Sink())[1],0,want_audio=True)
+        relay.serve()
+        self.addCleanup(relay.close)
+        conn = http.client.HTTPConnection('127.0.0.1',relay.port,timeout=5)
+        conn.request('POST','/tok/chunk',body=b'x',headers={'Host':'127.0.0.1:%d'%relay.port,'X-Seq':'0','X-Has-Audio':'0','X-Surface':'monitor'})
+        self.assertEqual(conn.getresponse().status,200)
+        self.assertEqual(started,[False])
 
     def test_auto_stop_fires_after_the_limit_and_zero_means_no_limit(self):
         self.assertIsNone(s.start_auto_stop(0,lambda:None))
